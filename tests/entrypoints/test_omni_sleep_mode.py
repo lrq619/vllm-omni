@@ -24,21 +24,21 @@ async def omni_engine():
         "trust_remote_code": True,
         "video_pruning_rate": 0.99,
         "max_model_len": 2048,
-        "gpu_memory_utilization": 0.5
+        "gpu_memory_utilization": 0.45
     }
 
     stages = [
         # Stage 0 (Thinker): put 0
         {"stage_id": 0, "stage_type": "llm", "runtime": {"process": True, "devices": "0", "max_batch_size": 1}, 
-         "engine_args": {**common_args, "model_stage": "thinker"}},
+         "engine_args": {**common_args, "model_stage": "thinker", "gpu_memory_utilization": 0.8}},
         
         # Stage 1 (Talker): put 1
         {"stage_id": 1, "stage_type": "llm", "runtime": {"process": True, "devices": "1", "max_batch_size": 1}, 
-         "engine_args": {**common_args, "model_stage": "talker"}},
+         "engine_args": {**common_args, "model_stage": "talker", "gpu_memory_utilization": 0.45}},
         
         # Stage 2 (Diffusion): put 0 to test sleep/wakeup logic on the same GPU as Stage 0
-        {"stage_id": 2, "stage_type": "llm", "runtime": {"process": True, "devices": "0", "max_batch_size": 1}, 
-         "engine_args": {**common_args, "model_stage": "code2wav", "worker_type": "generation"}}
+        {"stage_id": 2, "stage_type": "llm", "runtime": {"process": True, "devices": "1", "max_batch_size": 1}, 
+         "engine_args": {**common_args, "model_stage": "code2wav", "worker_type": "generation", "gpu_memory_utilization": 0.45}}
     ]
 
     engine = AsyncOmni(model_name, stages=stages)
@@ -111,7 +111,7 @@ class TestOmniSleepMode:
         logger.info(f"Initial VRAM Reserved: {initial_mem / 1024**3:.2f} GiB")
         # Trigger deep sleep (Level 2)
         # Verification: await must return only after all Workers have finished moving GPU memory.
-        acks = await omni_engine.sleep(stage_ids=[0], level=2)
+        acks = await omni_engine.sleep(stage_ids=[2], level=2)
         torch.cuda.empty_cache()
         post_sleep_mem = torch.cuda.memory_reserved(0)
         freed_gb = (initial_mem - post_sleep_mem) / 1024**3

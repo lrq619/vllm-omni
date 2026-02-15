@@ -36,9 +36,33 @@ logger = init_logger(__name__)
 class OmniGPUModelRunner(GPUModelRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        
+        if self.model_config.model_stage == "code2wav":
+            self.vllm_config.cache_config.kv_cache_groups = []
+            self.vllm_config.cache_config.enable_prefix_caching = False
+
         self._omni_per_req_additional_information: dict[str, dict] | None = None
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
+    
+    def _get_slot_mappings(
+        self,
+        num_tokens_padded: int,
+        num_reqs_padded: int,
+        num_tokens_unpadded: int,
+        ubatch_slices: Any,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        if not hasattr(self, "kv_cache_config") or not self.kv_cache_config.kv_cache_groups:
+            return [], torch.zeros(num_tokens_padded, dtype=torch.int64, device=self.device)
+        
+        # For cached stages (Stage-0/1), the standard v1 addressing path is used.
+        blk_table = self.input_batch.block_table[0]
+        slot_mappings = blk_table.slot_mapping.gpu[:num_tokens_padded]
+
+        slot_mappings_by_group = [
+            slot_mappings for _ in range(len(self.kv_cache_config.kv_cache_groups))
+        ]
+        return slot_mappings_by_group, slot_mappings
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)

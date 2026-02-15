@@ -255,7 +255,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 cudagraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
@@ -536,7 +535,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             )
         )
 
-        if cudagraph_runtime_mode is None:
+        if cudagraph_runtime_mode is None or self.model_config.model_stage == "code2wav":
             cudagraph_runtime_mode = _cudagraph_mode
         else:
             assert cudagraph_runtime_mode == _cudagraph_mode, (
@@ -594,7 +593,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 max_query_len=max_query_len,
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
-                slot_mappings=slot_mappings_by_group,
             )
 
         with self.maybe_dummy_run_with_lora(
@@ -659,7 +657,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
-                    slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
                 ),
             ):
                 outputs = self.model(

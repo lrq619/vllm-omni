@@ -225,7 +225,6 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
             if mm and hasattr(mm, "__dict__"):
                 config_dict.update(mm.__dict__)
 
-        # 2. 补齐 Omni 核心字段
         config_dict["stage_id"] = self.stage_id
         config_dict["async_chunk"] = self.async_chunk
         config_dict["model_stage"] = self.model_stage

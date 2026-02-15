@@ -289,10 +289,13 @@ class Qwen2_5OmniForConditionalGeneration(
                 text_hidden_states = thinker_output
 
             # Text-only path
-            return OmniOutput(
-                text_hidden_states=(text_hidden_states.reshape(-1, text_hidden_states.shape[-1])),
-                multimodal_outputs=None,
-            )
+            is_profiling = (logits_index is None and codec is None and 
+                not kwargs.get("runtime_additional_information"))
+            res_tensor = text_hidden_states.reshape(-1, text_hidden_states.shape[-1])
+            if is_profiling:
+                return res_tensor
+            return OmniOutput(text_hidden_states=res_tensor, multimodal_outputs=None)
+
 
         # 2) Talker (if codec not provided)
         if self.model_stage == "talker":
@@ -323,12 +326,22 @@ class Qwen2_5OmniForConditionalGeneration(
                 # which do not match with the talker model's word embedding size
                 sampling_metadata.prompt_token_ids[sampling_metadata.prompt_token_ids == 152064] = 8448
 
-            return OmniOutput(
-                text_hidden_states=talker_hidden,
-                multimodal_outputs=None,
-            )
+            is_profiling = (logits_index is None and codec is None and 
+                not kwargs.get("runtime_additional_information"))
+            res_tensor = talker_hidden.reshape(-1, talker_hidden.shape[-1])
+            if is_profiling:
+                return res_tensor
+            return OmniOutput(text_hidden_states=res_tensor, multimodal_outputs=None)
 
         if self.model_stage == "code2wav":
+
+            is_profiling = (logits_index is None and codec is None and 
+                           not kwargs.get("runtime_additional_information"))
+            if is_profiling:
+                dev = self._module_device(self.model)
+                return OmniOutput(text_hidden_states=None, 
+                                 multimodal_outputs={"model_outputs": torch.zeros(1, device=dev)})
+            
             code = (
                 input_ids
                 if input_ids is not None
@@ -338,10 +351,9 @@ class Qwen2_5OmniForConditionalGeneration(
                     device=inputs_embeds.device,
                 )
             )
-
-            code = code[:-1] if code[-1] == TALKER_CODEC_EOS_TOKEN_ID else code
-            code = code[1:] if code[0] == TALKER_CODEC_BOS_TOKEN_ID else code
-
+            if code.numel() > 2:
+                code = code[:-1] if code[-1] == TALKER_CODEC_EOS_TOKEN_ID else code
+                code = code[1:] if code[0] == TALKER_CODEC_BOS_TOKEN_ID else code
             audio_tensor = self.generate_audio(code, voice_type)
             return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": audio_tensor})
 
