@@ -64,6 +64,9 @@ class DiffusionWorker:
         self.local_rank = local_rank
         self.rank = rank
         self.od_config = od_config
+
+        self.stage_id = getattr(od_config, "stage_id", 2)
+
         self.device: torch.device | None = None
         self.vllm_config: VllmConfig | None = None
         self.model_runner: DiffusionModelRunner | None = None
@@ -184,6 +187,10 @@ class DiffusionWorker:
             level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
         """
         from vllm.device_allocator.cumem import CuMemAllocator
+        import torch
+        total = torch.cuda.get_device_properties(self.device).total_memory
+        used = torch.cuda.memory_allocated(self.device)
+        freed = 0.0
 
         free_bytes_before_sleep = current_omni_platform.get_free_memory()
 
@@ -200,15 +207,14 @@ class DiffusionWorker:
 
         free_bytes_after_sleep = current_omni_platform.get_free_memory()
         device_id = self.device.index if self.device.index is not None else 0
-        total = current_omni_platform.get_device_total_memory(device_id)
+        total = torch.cuda.get_device_properties(self.device).total_memory
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
         assert freed_bytes >= 0, "Memory usage increased after sleeping."
         logger.info(
-            "Sleep mode freed %.2f GiB memory, %.2f GiB memory is still in use.",
-            current_omni_platform.device_type,
-            freed_bytes / GiB_bytes,
-            used_bytes / GiB_bytes,
+            'Sleep mode freed %.2f GiB memory, %.2f GiB memory is still in use.',
+            freed / 1024**3, 
+            used / 1024**3
         )
         return True
 
@@ -238,7 +244,7 @@ class DiffusionWorker:
             self._sleep_saved_buffers = {}
         return True
 
-    def handle_sleep_task(self, task: OmniSleepTask) -> None:
+    def handle_sleep_task(self, task: OmniSleepTask) -> OmniACK:
         """
         Deterministic Sleep Processor:
         1. Perform physical garbage collection
@@ -257,37 +263,43 @@ class DiffusionWorker:
                 self.sleep(level=task.level)
 
             freed = initial_reserved - current_omni_platform.get_memory_reserved()
+
             ack = OmniACK(
                 task_id=task.task_id,
                 status="SUCCESS",
-                stage_id=getattr(self, "stage_id", 0),
+                stage_id=self.stage_id,
                 rank=self.rank,
                 freed_bytes=freed,
                 metadata={"cuda_graph_cleaned": task.level >= 2}
             )
-            self.result_mq.put(ack)
+            if hasattr(self, "result_mq") and self.result_mq:
+                self.result_mq.enqueue(ack)
+
             logger.info(f"[Diffusion Worker {self.rank}]: ACK emitted. Freed {freed / 1024**3:.2f} GiB.")
+            return ack
 
         except Exception as e:
             logger.error(f"[Diffusion Worker {self.rank}] Failed: {e}", exc_info=True)
-            self.result_mq.put(OmniACK(task_id=task.task_id, status="ERROR", error_msg=str(e)))
+            if hasattr(self, "result_mq") and self.result_mq:
+                self.result_mq.enqueue(OmniACK(task_id=task.task_id, status="ERROR", error_msg=str(e)))
 
     def handle_wake_task(self, task: OmniWakeTask) -> None:
         """Deterministic wake-up processor"""
         try:
             logger.info(f"[Diffusion Worker {self.rank}] Responding to Wake-up Task: {task.task_id}")
             self.wake_up(tags=task.tags)
-            current_omni_platform.synchronize()
+            import torch
+            torch.cuda.synchronize()
             # send WARM ACK
             ack = OmniACK(
                 task_id=task.task_id,
                 status="SUCCESS",
                 metadata={"state": "WARM", "rank": self.rank}
             )
-            self.result_mq.put(ack)
+            self.result_mq.enqueue(ack)
             logger.info(f"[Diffusion Worker {self.rank}] Wake-up confirmed.")
         except Exception as e:
-            self.result_mq.put(OmniACK(task_id=task.task_id, status="ERROR", error_msg=str(e)))
+            self.result_mq.enqueue(OmniACK(task_id=task.task_id, status="ERROR", error_msg=str(e)))
 
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
@@ -335,6 +347,7 @@ class WorkerProc:
 
         assert od_config.master_port is not None
         self.worker = self._create_worker(gpu_id, od_config)
+        self.worker.result_mq = self.result_mq
         self.gpu_id = gpu_id
         self._running = True
 
@@ -414,13 +427,15 @@ class WorkerProc:
                     level=msg.get("level", 2),
                     task_id=msg.get("task_id", "local")
                 )
-                self.worker.handle_sleep_task(task_obj)
+                ack = self.worker.handle_sleep_task(task_obj)
+                self.return_result(ack)
             elif isinstance(msg, dict) and msg.get("type") == "wake_up":
                 task_obj = OmniWakeTask(
                     level=msg.get("level", 2),
                     task_id=msg.get("task_id", "local")
                 )
-                self.worker.handle_wake_task(task_obj)
+                ack = self.worker.handle_wake_task(task_obj)
+                self.return_result(ack)
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)
                 self._running = False

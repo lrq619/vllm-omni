@@ -137,42 +137,50 @@ class OmniGPUWorkerBase(GPUWorker):
     def handle_sleep_task(self, task: OmniSleepTask) -> OmniACK:
         "Handle deterministic Sleep command from the main process"
         try:
-            logger.info(f"[LLM Worker {self.rank}] Received Sleep Handshake: {task.task_id}")
+            if isinstance(task, dict):
+                task = OmniSleepTask(**task)
+
+            logger.info(f"[Omni Worker {self.rank}] Handshake Received: Task {task.task_id}, Level {task.level}")
             mem_before = get_process_gpu_memory(self.local_rank) or torch.cuda.memory_reserved()
+
             # Physical memory reclamation (if Level 2, destroy CUDA Graph)
             if task.level >= 2:
                 if hasattr(self.model_runner, "graph_runners"):
                     # CUDA Graphs for the LLM stage are stored in model_runner
                     self.model_runner.graph_runners.clear()
-                    logger.info(f"[LLM Worker {self.rank}] CUDA Graphs cleared.")
+                    logger.info(f"[Omni Worker {self.rank}] CUDA Graphs cleared.")
                 self.sleep(level=task.level)
             from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
             mem_after = get_process_gpu_memory(self.local_rank) or torch.cuda.memory_reserved()
             real_freed = max(0, mem_before - mem_after)
+
+            current_stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
             ack = OmniACK(
                 task_id=task.task_id,
                 status="SUCCESS",
-                stage_id=getattr(self, "stage_id", 0),
+                stage_id=current_stage_id,
                 rank=self.rank,
                 freed_bytes=real_freed,
                 metadata={"vram_after": mem_after}
             )
             if hasattr(self, "result_mq") and self.result_mq:
                 self.result_mq.put(ack)
-            logger.info(f"[LLM Worker {self.rank}] ACK emitted for Task {task.task_id}")
+            logger.info(f"[Omni Worker {self.rank}] ACK emitted for Task {task.task_id}")
             return ack
+
         except Exception as e:
-            logger.error(f"[LLM Worker {self.rank}] Sleep Task Failed: {e}")
-            if hasattr(self, "result_mq") and self.result_mq:
-                self.result_mq.put(OmniACK(task_id=task.task_id, status="ERROR", error_msg=str(e)))
+            logger.error(f"[Omni Worker {self.rank}] Sleep Task Failed: {e}")
+            return OmniACK(task_id=task.task_id, status="ERROR", error_msg=str(e))
 
     def handle_wake_task(self, task: OmniWakeTask) -> None:
         "Handle deterministic Wakeup command from the main process"
         try:
             self.wake_up(tags=task.tags)
-            ack = OmniACK(task_id=task.task_id, status="SUCCESS", rank=self.rank)
+            current_stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
+            ack = OmniACK(task_id=task.task_id, status="SUCCESS", stage_id=current_stage_id, rank=self.rank)
             if hasattr(self, "result_mq") and self.result_mq:
                 self.result_mq.put(ack)
+            logger.info(f"[Omni Worker {self.rank}] Wake-up ACK emitted.")
+            return ack
         except Exception as e:
-            if hasattr(self, "result_mq") and self.result_mq:
-                self.result_mq.put(OmniACK(task_id=task.task_id, status="ERROR", error_msg=str(e)))
+            return OmniACK(task_id=task.task_id, status="ERROR", error_msg=str(e))

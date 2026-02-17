@@ -1315,18 +1315,16 @@ async def _stage_worker_async(
                 asyncio.create_task(stage_engine.abort(rid))
             elif task_type == OmniStageTaskType.SLEEP:
                 from vllm_omni.diffusion.data import OmniSleepTask
-                loop = asyncio.get_running_loop()
-                loop.run_in_executor(None, stage_engine.handle_sleep_task, OmniSleepTask(
+                asyncio.create_task(stage_engine.handle_sleep_task(OmniSleepTask(
                     task_id=task.get("task_id", "local"),
                     level=task.get("level", 2)
-                ))
+                )))
             elif task_type == OmniStageTaskType.WAKE_UP:
                 from vllm_omni.diffusion.data import OmniWakeTask
-                loop = asyncio.get_running_loop()
-                loop.run_in_executor(None, stage_engine.handle_wake_task, OmniWakeTask(
+                asyncio.create_task(stage_engine.handle_wake_up_task(OmniWakeTask(
                     task_id=task.get("task_id", "local"),
                     tags=task.get("tags")
-                ))
+                )))
             elif is_profiler_task(task_type):
                 await handle_profiler_task_async(task_type)
             else:

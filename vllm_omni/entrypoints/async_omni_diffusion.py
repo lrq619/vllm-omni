@@ -298,3 +298,22 @@ class AsyncOmniDiffusion:
             None,
         )
         return all(results) if isinstance(results, list) else results
+
+    async def handle_sleep_task(self, task: Any) -> Any:
+        """
+        The sleep command is physically forwarded from the Orchestrator 
+        to the underlying Engine.
+        """
+        task_id = getattr(task, "task_id", str(uuid.uuid4()))
+        level = getattr(task, "level", 2)
+        logger.info(f"[Entrypoint] Relaying Sleep Task: {task_id} (Level: {level})")
+        return await self.engine.sleep(level=level, task_id=task_id)
+    
+    async def handle_wake_up_task(self, task: Any) -> Any:
+        """
+        Physical forwarding of wake-up commands
+        """
+        task_id = getattr(task, "task_id", str(uuid.uuid4()))
+        tags = getattr(task, "tags", None)
+        logger.info(f"[Entrypoint] Relaying WakeUp Task: {task_id}")
+        return await self.engine.wake_up(tags=tags, task_id=task_id)

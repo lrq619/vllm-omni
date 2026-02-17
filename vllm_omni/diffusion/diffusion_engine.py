@@ -60,6 +60,9 @@ class DiffusionEngine:
         """
         self.od_config = od_config
 
+        if not hasattr(self.od_config, "stage_id"):
+            setattr(self.od_config, "stage_id", 2)
+
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
 
@@ -386,7 +389,7 @@ class DiffusionEngine:
         pass
 
 
-    async def sleep(self, level: int = 2) -> list[OmniACK]:
+    async def sleep(self, level: int = 2, task_id: str | None = None) -> list[OmniACK]:
         """
         Deterministic Memory Reclamation Interface
         Responsibilities: Initiate physical memory reclamation 
@@ -396,7 +399,7 @@ class DiffusionEngine:
             logger.warning("Orchestrator resolver not found, falling back to basic sleep.")
             return self.collective_rpc("handle_sleep_task", args=(OmniSleepTask("local", level),))
 
-        task_id = str(uuid.uuid4())
+        task_id = task_id or str(uuid.uuid4())
 
         expected = self.executor.get_worker_count() if hasattr(self.executor, "get_worker_count") else 1
         future = self.orchestrator.resolver.watch_task(task_id, expected_count=expected)
@@ -410,12 +413,12 @@ class DiffusionEngine:
         # Ensures that the video memory is truly physically released upon returning.
         return await asyncio.wait_for(future, timeout=60.0)
 
-    async def wake_up(self, tags: list[str] | None = None) -> list[OmniACK]:
+    async def wake_up(self, tags: list[str] | None = None, task_id: str | None = None) -> list[OmniACK]:
         """Deterministic wake-up interface"""
         if self.orchestrator is None or not hasattr(self.orchestrator, "resolver"):
             return self.collective_rpc("handle_wake_task", args=(OmniWakeTask("local", tags),))
 
-        task_id = str(uuid.uuid4())
+        task_id = task_id or str(uuid.uuid4())
 
         expected = self.executor.get_worker_count() if hasattr(self.executor, "get_worker_count") else 1
         future = self.orchestrator.resolver.watch_task(task_id, expected_count=expected)
