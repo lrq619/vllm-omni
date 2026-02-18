@@ -6,6 +6,8 @@ import socket
 from typing import TYPE_CHECKING
 
 import torch
+import uuid
+from typing import Any
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -23,6 +25,8 @@ from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
 from vllm_omni.engine.input_processor import OmniInputProcessor
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
+
+from vllm_omni.diffusion.data import OmniACK, OmniSleepTask, OmniWakeTask
 
 if TYPE_CHECKING:
     pass
@@ -216,4 +220,28 @@ class AsyncOmniLLM(AsyncLLM):
             client_count=client_count,
             client_index=client_index,
             engine_args=engine_args,
+        )
+
+    async def handle_sleep_task(self, task: Any) -> list[OmniACK]:
+        """
+        Physical pass-through to the underlying LLM Engine
+        """
+        task_id = getattr(task, "task_id", str(uuid.uuid4()))
+        level = getattr(task, "level", 2)
+        logger.info(f"[LLM Entrypoint] Relaying Sleep Task: {task_id}, Level: {level}")
+        return await self.engine_client.collective_rpc(
+            "handle_sleep_task",
+            args=(OmniSleepTask(task_id=task_id, level=level),)
+        )
+    
+    async def handle_wake_up_task(self, task: Any) -> list[OmniACK]:
+        """
+        Physical pass-through to the underlying LLM Engine
+        """
+        task_id = getattr(task, "task_id", str(uuid.uuid4()))
+        tags = getattr(task, "tags", None)
+        logger.info(f"[LLM Entrypoint] Relaying WakeUp Task: {task_id}")
+        return await self.engine_client.collective_rpc(
+            "handle_wake_task",
+            args=(OmniWakeTask(task_id=task_id, tags=tags),)
         )

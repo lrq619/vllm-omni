@@ -26,6 +26,7 @@ from vllm_omni.entrypoints.utils import (
     load_stage_configs_from_yaml,
     resolve_model_config_path,
 )
+from vllm_omni.diffusion.data import OmniACK
 
 logger = init_logger(__name__)
 
@@ -239,3 +240,51 @@ class OmniLLM(LLM):
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
         return sorted(outputs, key=lambda x: int(x.request_id.split("-")[0]))
+
+    
+    async def sleep(self, level: int = 2, task_id: str | None = None) -> list[OmniACK]:
+        """
+        Deterministic Memory Reclamation for LLM
+        Physically broadcast to all LLM GPU Workers (TP/DP)
+        """
+        import uuid
+        import asyncio
+        from vllm_omni.diffusion.data import OmniSleepTask
+        task_id = task_id or str(uuid.uuid4())
+
+        executor = getattr(self.llm_engine, "engine_core", None)
+        if executor is None and hasattr(self.llm_engine, "engine_core"):
+            executor = self.llm_engine.engine_core
+
+        logger.info(f"[LLM Engine] Broadcasting Sleep Task {task_id} to workers...")
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            executor.collective_rpc,
+            "handle_sleep_task",
+            60.0, # Timeout
+            (OmniSleepTask(task_id=task_id, level=level),)
+        )
+
+    async def wake_up(self, tags: list[str] | None = None, task_id: str | None = None) -> list[OmniACK]:
+        """
+        Deterministic Wake-up for LLM
+        """
+        import uuid
+        import asyncio
+        from vllm_omni.diffusion.data import OmniWakeTask
+        task_id = task_id or str(uuid.uuid4())
+
+        executor = getattr(self.llm_engine, "engine_core", None) or self.llm_engine
+        if executor is None and hasattr(self.llm_engine, "engine_core"):
+            executor = self.llm_engine.engine_core
+            
+        logger.info(f"[LLM Engine] Broadcasting Wake-up Task {task_id} to workers...")
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            executor.collective_rpc,
+            "handle_wake_task",
+            120.0, # Timeout
+            (OmniWakeTask(task_id=task_id, tags=tags),)
+        )

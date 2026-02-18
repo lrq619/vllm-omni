@@ -395,38 +395,46 @@ class DiffusionEngine:
         Responsibilities: Initiate physical memory reclamation 
         and wait for acknowledgments (ACKs) from all Workers.
         """
-        if self.orchestrator is None or not hasattr(self.orchestrator, "resolver"):
-            logger.warning("Orchestrator resolver not found, falling back to basic sleep.")
-            return self.collective_rpc("handle_sleep_task", args=(OmniSleepTask("local", level),))
-
         task_id = task_id or str(uuid.uuid4())
-
+        resolver = getattr(self.orchestrator, "event_resolver", None) or getattr(self.orchestrator, "resolver", None)
+        if resolver is None:
+            logger.info(f"[Diffusion Engine Relay] Dispatching Sleep Task {task_id} (Level: {level})")
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, 
+                self.collective_rpc, 
+                "handle_sleep_task", 
+                60.0, # Timeout
+                (OmniSleepTask(task_id=task_id, level=level),)
+            )
         expected = self.executor.get_worker_count() if hasattr(self.executor, "get_worker_count") else 1
-        future = self.orchestrator.resolver.watch_task(task_id, expected_count=expected)
-        # Send RPC commands to all Workers
+        future = resolver.watch_task(task_id, expected_count=expected)
         self.executor.send_rpc_request(
             "handle_sleep_task", 
             args=(OmniSleepTask(task_id=task_id, level=level),)
         )
-        logger.info(f"[Engine] Sleep initiated. Task ID: {task_id}. Awaiting {expected} ACKs...")
-        # Blocking Suspension: The suspension will only be lifted upon receiving all ACKs or a timeout.
-        # Ensures that the video memory is truly physically released upon returning.
+        logger.info(f"[Diffusion Engine] Sleep Task {task_id} dispatched. Awaiting {expected} ACKs...")
         return await asyncio.wait_for(future, timeout=60.0)
 
     async def wake_up(self, tags: list[str] | None = None, task_id: str | None = None) -> list[OmniACK]:
         """Deterministic wake-up interface"""
-        if self.orchestrator is None or not hasattr(self.orchestrator, "resolver"):
-            return self.collective_rpc("handle_wake_task", args=(OmniWakeTask("local", tags),))
-
         task_id = task_id or str(uuid.uuid4())
-
+        resolver = getattr(self.orchestrator, "event_resolver", None) or getattr(self.orchestrator, "resolver", None)
+        if resolver is None:
+            logger.info(f"[Diffusion Engine Relay] Dispatching Wake-up Task {task_id} to workers...")
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None,
+                self.collective_rpc,
+                "handle_wake_task",
+                120.0, # Timeout
+                (OmniWakeTask(task_id=task_id, tags=tags),)
+            )
         expected = self.executor.get_worker_count() if hasattr(self.executor, "get_worker_count") else 1
-        future = self.orchestrator.resolver.watch_task(task_id, expected_count=expected)
-
+        future = resolver.watch_task(task_id, expected_count=expected)
         self.executor.send_rpc_request(
             "handle_wake_task",
             args=(OmniWakeTask(task_id=task_id, tags=tags),)
         )
-
-        logger.info(f"[Engine] Wake-up initiated. Task ID: {task_id}. Awaiting {expected} ACKs...")
+        logger.info(f"[Diffusion Engine] Wake-up Task {task_id} dispatched. Awaiting {expected} ACKs...")
         return await asyncio.wait_for(future, timeout=60.0)

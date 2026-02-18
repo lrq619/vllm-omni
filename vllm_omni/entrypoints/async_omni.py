@@ -89,8 +89,9 @@ class AsyncEventResolver:
 
         # Once an ACK is received, 
         # the data in the video memory is recorded into the indicator database.
-        if hasattr(self,"orchestrator") and self.orchestrator.metrics:
-            self.orchestrator.metrics.record_vram_reclaimed(getattr(ack, "freed_bytes", 0))
+        orchestrator = getattr(self, "orchestrator", None)
+        if orchestrator and getattr(orchestrator, "metrics", None):
+            orchestrator.metrics.record_vram_reclaimed(getattr(ack, "freed_bytes", 0))
 
         # The Future is only awakened after all Workers' ACKs have been received.
         if len (task_info["received"]) >= task_info["expected_count"]:
@@ -622,6 +623,11 @@ class AsyncOmni(OmniBase):
                             continue
                         idle = False
                         #Intercept and parse the ACK signal
+                        if isinstance(result, dict) and result.get("type") == "ack":
+                            ack_obj = result.get("ack")
+                            logger.info(f"[{self._name}] Intercepted wrapped ACK for task {ack_obj.task_id} from stage-{stage_id}")
+                            await self.event_resolver.resolve(ack_obj)
+                            continue
                         if isinstance(result, OmniACK):
                             logger.debug(f"[{self._name}] Received ACK for task {result.task_id} from stage-{stage_id}")
                             await self.event_resolver.resolve(result)
@@ -855,6 +861,7 @@ class AsyncOmni(OmniBase):
         """
         Directed phase control + deterministic waiting
         """
+        self._run_output_handler()
         if stage_ids is None:
             stage_ids = list(range(len(self.stage_list)))
         total_workers = 0
@@ -878,6 +885,7 @@ class AsyncOmni(OmniBase):
         """
         Directed phase control + deterministic waiting
         """
+        self._run_output_handler()
         if stage_ids is None:
             stage_ids = list(range(len(self.stage_list)))
         total_workers = 0

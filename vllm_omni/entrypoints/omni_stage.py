@@ -1315,13 +1315,26 @@ async def _stage_worker_async(
                 asyncio.create_task(stage_engine.abort(rid))
             elif task_type == OmniStageTaskType.SLEEP:
                 from vllm_omni.diffusion.data import OmniSleepTask
-                asyncio.create_task(stage_engine.handle_sleep_task(OmniSleepTask(
+                async def _run_sleep_and_forward(t: OmniSleepTask):
+                    acks = await stage_engine.handle_sleep_task(t)
+                    if acks and isinstance(acks, list):
+                        for ack in acks:
+                            out_q.put({"type": "ack", "ack": ack})
+                    logger.info(f"[Stage-{stage_id}] Sleep ACKs forwarded to Orchestrator")
+                from vllm_omni.diffusion.data import OmniSleepTask
+                asyncio.create_task(_run_sleep_and_forward(OmniSleepTask(
                     task_id=task.get("task_id", "local"),
                     level=task.get("level", 2)
                 )))
             elif task_type == OmniStageTaskType.WAKE_UP:
                 from vllm_omni.diffusion.data import OmniWakeTask
-                asyncio.create_task(stage_engine.handle_wake_up_task(OmniWakeTask(
+                async def _run_wake_and_forward(t: OmniWakeTask):
+                    acks = await stage_engine.handle_wake_up_task(t)
+                    if acks and isinstance(acks, list):
+                        for ack in acks:
+                            out_q.put({"type": "ack", "ack": ack})
+                from vllm_omni.diffusion.data import OmniWakeTask
+                asyncio.create_task(_run_wake_and_forward(OmniWakeTask(
                     task_id=task.get("task_id", "local"),
                     tags=task.get("tags")
                 )))
