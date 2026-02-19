@@ -180,6 +180,7 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
     async_chunk: bool = False
     omni_kv_config: dict | None = None
     video_pruning_rate: float = 0.99
+    worker_cls: str = None
 
     def draw_hf_text_config(self, config_dict: dict) -> Qwen3OmniMoeTextConfig:
         # transformers' get_text_config method is used to get the text config from thinker_config.
@@ -200,6 +201,12 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
         return get_hf_text_config(hf_config)
 
     def __post_init__(self) -> None:
+        if self.worker_cls is None or self.worker_cls == "vllm.v1.worker.gpu_worker.Worker":
+            if self.model_stage in ["thinker", "talker"]:
+                self.worker_cls = "vllm_omni.worker.gpu_ar_worker.GPUARWorker"
+            elif self.model_stage == "generation":
+                self.worker_cls = "vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker"
+
         load_omni_general_plugins()
         super().__post_init__()
 

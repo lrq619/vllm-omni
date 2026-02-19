@@ -222,26 +222,28 @@ class AsyncOmniLLM(AsyncLLM):
             engine_args=engine_args,
         )
 
-    async def handle_sleep_task(self, task: Any) -> list[OmniACK]:
-        """
-        Physical pass-through to the underlying LLM Engine
-        """
-        task_id = getattr(task, "task_id", str(uuid.uuid4()))
-        level = getattr(task, "level", 2)
-        logger.info(f"[LLM Entrypoint] Relaying Sleep Task: {task_id}, Level: {level}")
-        return await self.engine_client.collective_rpc(
+    async def sleep(self, level: int = 2, task_id: str | None = None) -> list[OmniACK]:
+        from vllm_omni.diffusion.data import OmniSleepTask
+        tid = task_id or str(uuid.uuid4())
+        logger.info(f"[AsyncOmniLLM] Engine Relay: Sleep Task {tid} (Level {level})")
+        results = await self.engine_core.collective_rpc_async(
             "handle_sleep_task",
-            args=(OmniSleepTask(task_id=task_id, level=level),)
+            args=(OmniSleepTask(task_id=tid, level=level),)
         )
-    
-    async def handle_wake_up_task(self, task: Any) -> list[OmniACK]:
-        """
-        Physical pass-through to the underlying LLM Engine
-        """
-        task_id = getattr(task, "task_id", str(uuid.uuid4()))
-        tags = getattr(task, "tags", None)
-        logger.info(f"[LLM Entrypoint] Relaying WakeUp Task: {task_id}")
-        return await self.engine_client.collective_rpc(
+        return results if isinstance(results, list) else [results]
+
+    async def wake_up(self, tags: list[str] | None = None, task_id: str | None = None) -> list[OmniACK]:
+        from vllm_omni.diffusion.data import OmniWakeTask
+        tid = task_id or str(uuid.uuid4())
+        logger.info(f"[AsyncOmniLLM] Engine Relay: WakeUp Task {tid}")
+        results = await self.engine_core.collective_rpc_async(
             "handle_wake_task",
-            args=(OmniWakeTask(task_id=task_id, tags=tags),)
+            args=(OmniWakeTask(task_id=tid, tags=tags),)
         )
+        return results if isinstance(results, list) else [results]
+
+    async def handle_sleep_task(self, task: Any) -> list[OmniACK]:
+        return await self.sleep(level=getattr(task, "level", 2), task_id=getattr(task, "task_id", None))
+
+    async def handle_wake_up_task(self, task: Any) -> list[OmniACK]:
+        return await self.wake_up(tags=getattr(task, "tags", None), task_id=getattr(task, "task_id", None))

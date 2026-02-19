@@ -36,12 +36,12 @@ async def llm_engine():
         "gpu_memory_utilization": 0.45
     }
     stages = [
-        # Stage 0 (Thinker): put 0
+        # Stage 0 (Thinker): put 0   test test_auto_wakeup_llm update from 0.8 to 0.7 --- IGNORE ---
         {"stage_id": 0, "stage_type": "llm", "runtime": {"process": True, "devices": "0", "max_batch_size": 1}, 
-         "engine_args": {**common_args, "model_stage": "thinker", "gpu_memory_utilization": 0.8}},
-        # Stage 1 (Talker): put 1
+         "engine_args": {**common_args, "model_stage": "thinker", "gpu_memory_utilization": 0.7}},
+        # Stage 1 (Talker): put 1    test test_coordinated_cross_device update from 0.45 to 0.2 --- IGNORE ---
         {"stage_id": 1, "stage_type": "llm", "runtime": {"process": True, "devices": "1", "max_batch_size": 1}, 
-         "engine_args": {**common_args, "model_stage": "talker", "gpu_memory_utilization": 0.1}},
+         "engine_args": {**common_args, "model_stage": "talker", "gpu_memory_utilization": 0.2}},
     ]
     engine = AsyncOmni(model_name, stages=stages)
     for stage in engine.stage_list:
@@ -62,7 +62,7 @@ async def diffusion_engine():
             "runtime": {"process": True, "devices": "1", "max_batch_size": 1}, 
             "engine_args": {
                 "model_stage": "base", 
-                "gpu_memory_utilization": 0.45,
+                "gpu_memory_utilization": 0.6, # test test_coordinated_cross_device update from 0.45 to 0.6 --- IGNORE ---
                 "model_class_name": "FluxPipeline",
                 "enable_sleep_mode": True
             },
@@ -87,12 +87,15 @@ class TestOmniSleepMode:
         vram_before = get_vram_info(0)["reserved"]
         logger.info(f"Thinker initial VRAM: {vram_before:.2f} GiB")
         acks = await llm_engine.sleep(stage_ids=[0], level=2)
-        assert all(ack.status == "SUCCESS" for ack in acks)
-        torch.cuda.empty_cache()
-        await asyncio.sleep(1)
-        vram_after = get_vram_info(0)["reserved"]
-        logger.info(f"Thinker VRAM after sleep: {vram_after:.2f} GiB")
-        assert vram_after < vram_before
+        def _get_val(ack, key, default=None):
+            return getattr(ack, key, ack.get(key) if isinstance(ack, dict) else default)
+        # Verification signal successful
+        assert all(_get_val(ack, "status") == "SUCCESS" for ack in acks)
+        # Verify physical recycling volume
+        total_freed_bytes = sum(_get_val(ack, "freed_bytes", 0) for ack in acks)
+        freed_gib = total_freed_bytes / 1024**3
+        logger.info(f"Thinker VRAM physically reclaimed: {freed_gib:.2f} GiB")
+        assert freed_gib > 5.0
 
 
     @pytest.mark.asyncio

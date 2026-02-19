@@ -79,10 +79,14 @@ class AsyncEventResolver:
         }
         return fut
     async def resolve(self, ack: OmniACK):
-        task_info = self._pending_tasks.get(ack.task_id)
+        # ACK for dictionary type
+        tid = getattr(ack, "task_id", ack.get("task_id") if isinstance(ack, dict) else None)
+        
+        task_info = self._pending_tasks.get(tid)
         if task_info is None:
-            logger.warning(f"Received ACK for unknown task_id {ack.task_id}")
+            logger.warning(f"Received ACK for unknown task_id {tid}")
             return
+        
         if "received" not in task_info:
             task_info["received"] = []
         task_info["received"].append(ack)
@@ -91,11 +95,12 @@ class AsyncEventResolver:
         # the data in the video memory is recorded into the indicator database.
         orchestrator = getattr(self, "orchestrator", None)
         if orchestrator and getattr(orchestrator, "metrics", None):
-            orchestrator.metrics.record_vram_reclaimed(getattr(ack, "freed_bytes", 0))
+            freed = getattr(ack, "freed_bytes", ack.get("freed_bytes", 0) if isinstance(ack, dict) else 0)
+            orchestrator.metrics.record_vram_reclaimed(freed)
 
         # The Future is only awakened after all Workers' ACKs have been received.
         if len (task_info["received"]) >= task_info["expected_count"]:
-                self._pending_tasks.pop(ack.task_id)
+                self._pending_tasks.pop(tid)
                 fut = task_info["future"]
                 if not fut.done():
                     fut.set_result(task_info["received"])
@@ -319,6 +324,12 @@ class AsyncOmni(OmniBase):
         # Wait until generation is resumed if the engine is paused.
         async with self._pause_cond:
             await self._pause_cond.wait_for(lambda: not self._paused)
+
+        sleeping_stages = [s for s in self.stage_list if s.status == "SLEEPING"]
+        if sleeping_stages:
+            sids = [s.stage_id for s in sleeping_stages]
+            logger.info(f"[{self._name}] Detected sleeping stages {sids}. Triggering auto wake-up...")
+            await self.wake_up(stage_ids=sids)
 
         logger.debug(f"[{self._name}] generate() called")
         try:
@@ -624,9 +635,11 @@ class AsyncOmni(OmniBase):
                         idle = False
                         #Intercept and parse the ACK signal
                         if isinstance(result, dict) and result.get("type") == "ack":
-                            ack_obj = result.get("ack")
-                            logger.info(f"[{self._name}] Intercepted wrapped ACK for task {ack_obj.task_id} from stage-{stage_id}")
-                            await self.event_resolver.resolve(ack_obj)
+                            ack_data = result.get("ack")
+                            tid = getattr(ack_data, "task_id", 
+                                  ack_data.get("task_id") if isinstance(ack_data, dict) else "unknown")
+                            logger.info(f"[{self._name}] Intercepted wrapped ACK for task {tid} from stage-{stage_id}")
+                            await self.event_resolver.resolve(ack_data)
                             continue
                         if isinstance(result, OmniACK):
                             logger.debug(f"[{self._name}] Received ACK for task {result.task_id} from stage-{stage_id}")
@@ -879,7 +892,12 @@ class AsyncOmni(OmniBase):
             stage.update_status("TRANSITIONING")
             stage.sleep(level=level, task_id=task_id)
         logger.info(f"[{self._name}] Sleep initiated. Awaiting confirmation from {total_workers} workers...")
-        return await asyncio.wait_for(future, timeout=300)
+        acks = await asyncio.wait_for(future, timeout=300)
+
+        for stage_id in stage_ids:
+            self.stage_list[stage_id].update_status("SLEEPING")
+            
+        return acks
     
     async def wake_up(self, stage_ids: list[int] | None = None, tags: list[str] | None = None) -> list[OmniACK]:
         """
@@ -901,4 +919,9 @@ class AsyncOmni(OmniBase):
         for stage_id in stage_ids:
             self.stage_list[stage_id].wake_up(tags=tags, task_id=task_id)
         logger.info(f"[{self._name}] Wake-up initiated. Awaiting confirmation from {total_workers} workers...")
-        return await asyncio.wait_for(future, timeout=300)
+        acks = await asyncio.wait_for(future, timeout=300)
+
+        for stage_id in stage_ids:
+            self.stage_list[stage_id].update_status("RUNNING")
+            
+        return acks

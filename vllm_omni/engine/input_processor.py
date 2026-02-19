@@ -82,7 +82,7 @@ class OmniInputProcessor(InputProcessor):
         super().__init__(vllm_config, mm_registry)
         self.input_preprocessor = OmniInputPreprocessor(
             self.model_config,
-            vllm_config.observability_config,
+            self.tokenizer,
             mm_registry,
             mm_processor_cache=self.mm_processor_cache,
         )
@@ -133,42 +133,31 @@ class OmniInputProcessor(InputProcessor):
         self._validate_params(params)
 
         parallel_config = self.vllm_config.parallel_config
+
+        is_local_only = getattr(parallel_config, "local_engines_only", False)
         dp_size = parallel_config.data_parallel_size
-        dp_local_size = parallel_config.data_parallel_size_local
-        num_ranks = dp_local_size if parallel_config.local_engines_only else dp_size
+        dp_local_size = getattr(parallel_config, "data_parallel_size_local", dp_size)
+        
+        num_ranks = dp_local_size if is_local_only else dp_size
+        
         if data_parallel_rank is not None and not (0 <= data_parallel_rank < num_ranks):
             raise ValueError(f"data_parallel_rank {data_parallel_rank} is out of range [0, {num_ranks}).")
 
         if arrival_time is None:
             arrival_time = time.time()
 
-        # Optionally generate multimodal hash overrides to avoid hashing
-        # multimodal data items by their content as their identifiers.
-
-        # NOTE: when users explicitly turn off BOTH prefix caching and input
-        # processing caching, no multimodal features or embeddings will be
-        # reused across requests, therefore identifying multimodal data items
-        # by their content is no longer necessary, and we create uuids with
-        # request id-modality-index as multimodal hash overrides.
+        mm_uuids = None
         if (
             self.model_config.multimodal_config
             and self.model_config.multimodal_config.mm_processor_cache_gb == 0
             and not self.cache_config.enable_prefix_caching
         ):
-            mm_uuids = self._maybe_build_mm_uuids(request_id, prompt)
+            if hasattr(self, "_maybe_build_mm_uuids"):
+                mm_uuids = self._maybe_build_mm_uuids(request_id, prompt)
         else:
-            # Otherwise, use user-provided uuids as multimodal hash overrides
-            # if provided.
-            self._validate_mm_uuids(prompt)
             if isinstance(prompt, dict):
                 mm_uuids = cast(MultiModalUUIDDict | None, prompt.get("multi_modal_uuids"))
-            else:
-                mm_uuids = None
 
-        # Process inputs, which includes:
-        # 1. Tokenize text prompt, with LoRA request if one exists.
-        # 2. For multimodal models with a merged preprocessor, preprocess
-        #   multimodal data and expand prompt token ids accordingly.
         num_threads = int(os.environ.get("OMP_NUM_THREADS", "1"))
         if "OMP_NUM_THREADS" not in os.environ:
             logger.debug_once(

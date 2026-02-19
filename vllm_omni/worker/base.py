@@ -150,7 +150,7 @@ class OmniGPUWorkerBase(GPUWorker):
                     self.model_runner.graph_runners.clear()
                     logger.info(f"[Omni Worker {self.rank}] CUDA Graphs cleared.")
                 self.sleep(level=task.level)
-            from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
+
             mem_after = get_process_gpu_memory(self.local_rank) or torch.cuda.memory_reserved()
             real_freed = max(0, mem_before - mem_after)
 
@@ -175,6 +175,8 @@ class OmniGPUWorkerBase(GPUWorker):
     def handle_wake_task(self, task: OmniWakeTask) -> None:
         "Handle deterministic Wakeup command from the main process"
         try:
+            if isinstance(task, dict):
+                task = OmniWakeTask(**task)
             self.wake_up(tags=task.tags)
             current_stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
             ack = OmniACK(task_id=task.task_id, status="SUCCESS", stage_id=current_stage_id, rank=self.rank)
@@ -183,4 +185,6 @@ class OmniGPUWorkerBase(GPUWorker):
             logger.info(f"[Omni Worker {self.rank}] Wake-up ACK emitted.")
             return ack
         except Exception as e:
-            return OmniACK(task_id=task.task_id, status="ERROR", error_msg=str(e))
+            tid = task.get("task_id", "unknown") if isinstance(task, dict) else getattr(task, "task_id", "unknown")
+            logger.error(f"[Omni Worker {self.rank}] Wake-up Failed: {e}")
+            return OmniACK(task_id=tid, status="ERROR", error_msg=str(e))
