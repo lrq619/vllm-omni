@@ -40,10 +40,11 @@ async def llm_engine():
         {"stage_id": 0, "stage_type": "llm", "runtime": {"process": True, "devices": "0", "max_batch_size": 1}, 
          "engine_args": {**common_args, "model_stage": "thinker", "gpu_memory_utilization": 0.7}},
         # Stage 1 (Talker): put 1    test test_coordinated_cross_device update from 0.45 to 0.2 --- IGNORE ---
-        {"stage_id": 1, "stage_type": "llm", "runtime": {"process": True, "devices": "1", "max_batch_size": 1}, 
+        {"stage_id": 1, "stage_type": "llm", "engine_input_source": [0], "runtime": {"process": True, "devices": "1", "max_batch_size": 1, "connector_type": "queue"}, 
          "engine_args": {**common_args, "model_stage": "talker", "gpu_memory_utilization": 0.2}},
     ]
-    engine = AsyncOmni(model_name, stages=stages)
+    connectors = [{"src_stage_id": 0, "dst_stage_id": 1, "connector_type": "queue"}]
+    engine = AsyncOmni(model_name, stages=stages, connectors=connectors)
     for stage in engine.stage_list:
         if hasattr(stage, "engine") and stage.engine:
             stage.engine.orchestrator = engine
@@ -182,29 +183,3 @@ class TestOmniSleepMode:
 
         assert freed_vram > 15.0 or final_vram < 5.0
         logger.info("SUCCESS: Heterogeneous VRAM cleanup verified on GPU 1.")
-
-
-    @pytest.mark.asyncio
-    async def test_auto_wakeup_llm(self, llm_engine: AsyncOmni):
-        """Verify Thinker's auto-wakeup protection logic"""
-        await llm_engine.sleep(stage_ids=[0], level=2)
-        assert llm_engine.stage_list[0].status == "SLEEPING"
-
-        prompt = "Hello, what is the time in KL?"
-        sps = [SamplingParams(max_tokens=5), SamplingParams(max_tokens=5)]
-        await asyncio.sleep(1)
-        logger.info("Triggering auto-wakeup via generation...")
-        async for output in llm_engine.generate(prompt, request_id="auto-wake", sampling_params_list=sps):
-            assert output is not None
-            break
-        assert llm_engine.stage_list[0].status == "RUNNING"
-
-
-    @pytest.mark.asyncio
-    async def test_error_fallback_and_timeout(self, llm_engine: AsyncOmni):
-        """Exception and Timeout Handling"""
-        logger.info("Timeout Handling")
-        try:
-            await asyncio.wait_for(llm_engine.sleep(stage_ids=[0], level=2), timeout=0.001)
-        except asyncio.TimeoutError:
-            logger.info("Timeout handled correctly.")

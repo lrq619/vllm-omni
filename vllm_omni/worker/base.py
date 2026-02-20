@@ -140,7 +140,7 @@ class OmniGPUWorkerBase(GPUWorker):
             if isinstance(task, dict):
                 task = OmniSleepTask(**task)
 
-            logger.info(f"[Omni Worker {self.rank}] Handshake Received: Task {task.task_id}, Level {task.level}")
+            logger.info(f"[LLM Worker {self.rank}] Handshake Received: Task {task.task_id}, Level {task.level}")
             mem_before = get_process_gpu_memory(self.local_rank) or torch.cuda.memory_reserved()
 
             # Physical memory reclamation (if Level 2, destroy CUDA Graph)
@@ -148,7 +148,7 @@ class OmniGPUWorkerBase(GPUWorker):
                 if hasattr(self.model_runner, "graph_runners"):
                     # CUDA Graphs for the LLM stage are stored in model_runner
                     self.model_runner.graph_runners.clear()
-                    logger.info(f"[Omni Worker {self.rank}] CUDA Graphs cleared.")
+                    logger.info(f"[LLM Worker {self.rank}] CUDA Graphs cleared.")
                 self.sleep(level=task.level)
 
             mem_after = get_process_gpu_memory(self.local_rank) or torch.cuda.memory_reserved()
@@ -165,11 +165,11 @@ class OmniGPUWorkerBase(GPUWorker):
             )
             if hasattr(self, "result_mq") and self.result_mq:
                 self.result_mq.put(ack)
-            logger.info(f"[Omni Worker {self.rank}] ACK emitted for Task {task.task_id}")
+            logger.info(f"[LLM Worker {self.rank}] ACK emitted for Task {task.task_id}")
             return ack
 
         except Exception as e:
-            logger.error(f"[Omni Worker {self.rank}] Sleep Task Failed: {e}")
+            logger.error(f"[LLM Worker {self.rank}] Sleep Task Failed: {e}")
             return OmniACK(task_id=task.task_id, status="ERROR", error_msg=str(e))
 
     def handle_wake_task(self, task: OmniWakeTask) -> None:
@@ -182,9 +182,9 @@ class OmniGPUWorkerBase(GPUWorker):
             ack = OmniACK(task_id=task.task_id, status="SUCCESS", stage_id=current_stage_id, rank=self.rank)
             if hasattr(self, "result_mq") and self.result_mq:
                 self.result_mq.put(ack)
-            logger.info(f"[Omni Worker {self.rank}] Wake-up ACK emitted.")
+            logger.info(f"[LLM Worker {self.rank}] Wake-up ACK emitted.")
             return ack
         except Exception as e:
             tid = task.get("task_id", "unknown") if isinstance(task, dict) else getattr(task, "task_id", "unknown")
-            logger.error(f"[Omni Worker {self.rank}] Wake-up Failed: {e}")
+            logger.error(f"[LLM Worker {self.rank}] Wake-up Failed: {e}")
             return OmniACK(task_id=tid, status="ERROR", error_msg=str(e))
