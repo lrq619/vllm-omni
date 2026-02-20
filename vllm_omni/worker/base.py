@@ -114,12 +114,21 @@ class OmniGPUWorkerBase(GPUWorker):
         "Physical video memory unloading logic"
         from vllm.device_allocator.cumem import CuMemAllocator
         from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
+
         mem_before = get_process_gpu_memory(self.local_rank) or torch.cuda.memory_reserved()
+
         allocator = CuMemAllocator.get_instance()
         offload_tags = ("weights",) if level == 1 else tuple()
         allocator.sleep(offload_tags=offload_tags)
+
+        if level >= 2:
+            if hasattr(self.model_runner, "model") and self.model_runner.model:
+                logger.info(f"[LLM Worker {self.rank}] Level 2 Sleep: Offloading weights to CPU...")
+                self.model_runner.model.to("cpu")
+
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
         mem_after = get_process_gpu_memory(self.local_rank) or torch.cuda.memory_reserved()
         freed = mem_before - mem_after
         logger.info(f"[LLM Worker {self.rank}] Sleep mode freed {freed / 1024**3:.2f} GiB.")
@@ -127,6 +136,11 @@ class OmniGPUWorkerBase(GPUWorker):
 
     def wake_up(self, tags: list[str] | None = None) -> bool:
         "Physical video memory reloading logic"
+        if hasattr(self.model_runner, "model") and self.model_runner.model:
+            logger.info(f"[LLM Worker {self.rank}] Waking up: Reloading weights to {self.device}...")
+            self.model_runner.model.to(self.device)
+            torch.cuda.synchronize()
+            
         from vllm.device_allocator.cumem import CuMemAllocator
         allocator = CuMemAllocator.get_instance()
         allocator.wake_up(tags)
