@@ -121,6 +121,7 @@ class AsyncOmniLLM(AsyncLLM):
         self.input_processor = OmniInputProcessor(
             vllm_config=vllm_config,
             mm_registry=mm_registry,
+            tokenizer=tokenizer,
         )
 
         # OutputProcessor (converts EngineCoreOutputs --> RequestOutput).

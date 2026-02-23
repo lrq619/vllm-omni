@@ -99,3 +99,12 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
     def get_free_memory(cls, device: torch.device | None = None) -> int:
         free, _ = torch.cuda.mem_get_info(device)
         return free
+
+    @classmethod
+    def get_current_memory_usage(
+        cls, device: torch.types.Device | None = None
+    ) -> float:
+        torch.cuda.reset_peak_memory_stats(device)
+        free_mem, total_mem = torch.cuda.mem_get_info(device)
+        return total_mem - free_mem
+

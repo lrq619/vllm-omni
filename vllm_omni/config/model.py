@@ -31,7 +31,7 @@ logger = init_logger(__name__)
 
 
 @config
-@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True), kw_only=True)
 class OmniModelConfig(ModelConfig):
     """Configuration for Omni models, extending the base ModelConfig.
 
@@ -66,12 +66,7 @@ class OmniModelConfig(ModelConfig):
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
-    stage_connector_config: dict[str, Any] = field(
-        default_factory=lambda: {
-            "name": "SharedMemoryConnector",
-            "extra": {},
-        }
-    )
+    stage_connector_config: dict[str, Any] = None
     omni_kv_config: dict | None = None
 
     mm_encoder_tp_mode: Any = "weights"
@@ -109,12 +104,17 @@ class OmniModelConfig(ModelConfig):
     def __post_init__(
         self, *args, **kwargs, 
     ) -> None:
+        if self.stage_connector_config is None:
+            self.stage_connector_config = {
+                "name": "SharedMemoryConnector",
+                "extra": {},
+            }
         def extract_var(idx, key, default=None):
-            if len(args) > idx:
-                return args[idx]
             return kwargs.get(key, getattr(self, key, default))
         
         limit_mm_per_prompt   = extract_var(0, "limit_mm_per_prompt")
+        if isinstance(limit_mm_per_prompt, bool) or limit_mm_per_prompt is None:
+            limit_mm_per_prompt = {}
         enable_mm_embeds      = extract_var(1, "enable_mm_embeds")
         media_io_kwargs       = extract_var(2, "media_io_kwargs")
         mm_processor_kwargs   = extract_var(3, "mm_processor_kwargs")

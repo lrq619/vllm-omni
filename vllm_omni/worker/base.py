@@ -21,6 +21,8 @@ from vllm_omni.diffusion.data import (
     OmniWakeTask,
 )
 
+from vllm_omni.platforms import current_omni_platform
+
 logger = init_logger(__name__)
 
 
@@ -113,38 +115,23 @@ class OmniGPUWorkerBase(GPUWorker):
     def sleep(self, level: int = 1) -> bool:
         "Physical video memory unloading logic"
         from vllm.device_allocator.cumem import CuMemAllocator
-        from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
-
-        mem_before = get_process_gpu_memory(self.local_rank) or torch.cuda.memory_reserved()
-
+        mem_before = current_omni_platform.get_current_memory_usage(self.device)
         allocator = CuMemAllocator.get_instance()
         offload_tags = ("weights",) if level == 1 else tuple()
         allocator.sleep(offload_tags=offload_tags)
-
-        if level >= 2:
-            if hasattr(self.model_runner, "model") and self.model_runner.model:
-                logger.info(f"[LLM Worker {self.rank}] Level 2 Sleep: Offloading weights to CPU...")
-                self.model_runner.model.to("cpu")
-
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
-        mem_after = get_process_gpu_memory(self.local_rank) or torch.cuda.memory_reserved()
+        current_omni_platform.empty_cache()
+        current_omni_platform.synchronize()
+        mem_after = current_omni_platform.get_current_memory_usage(self.device)
         freed = mem_before - mem_after
         logger.info(f"[LLM Worker {self.rank}] Sleep mode freed {freed / 1024**3:.2f} GiB.")
         return True
 
     def wake_up(self, tags: list[str] | None = None) -> bool:
         "Physical video memory reloading logic"
-        if hasattr(self.model_runner, "model") and self.model_runner.model:
-            logger.info(f"[LLM Worker {self.rank}] Waking up: Reloading weights to {self.device}...")
-            self.model_runner.model.to(self.device)
-            torch.cuda.synchronize()
-            
         from vllm.device_allocator.cumem import CuMemAllocator
         allocator = CuMemAllocator.get_instance()
         allocator.wake_up(tags)
-        torch.cuda.synchronize()
+        current_omni_platform.synchronize()
         logger.info(f"[LLM Worker {self.rank}] Wake-up complete.")
         return True
 
@@ -155,20 +142,17 @@ class OmniGPUWorkerBase(GPUWorker):
                 task = OmniSleepTask(**task)
 
             logger.info(f"[LLM Worker {self.rank}] Handshake Received: Task {task.task_id}, Level {task.level}")
-            mem_before = get_process_gpu_memory(self.local_rank) or torch.cuda.memory_reserved()
-
-            # Physical memory reclamation (if Level 2, destroy CUDA Graph)
             if task.level >= 2:
                 if hasattr(self.model_runner, "graph_runners"):
-                    # CUDA Graphs for the LLM stage are stored in model_runner
                     self.model_runner.graph_runners.clear()
-                    logger.info(f"[LLM Worker {self.rank}] CUDA Graphs cleared.")
-                self.sleep(level=task.level)
+                    logger.info(f"[LLM Worker {self.rank}] LLM CUDA Graphs cleared.")
 
-            mem_after = get_process_gpu_memory(self.local_rank) or torch.cuda.memory_reserved()
+            mem_before = current_omni_platform.get_current_memory_usage(self.device)
+            self.sleep(level=task.level)
+            mem_after = current_omni_platform.get_current_memory_usage(self.device)
             real_freed = max(0, mem_before - mem_after)
-
             current_stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
+
             ack = OmniACK(
                 task_id=task.task_id,
                 status="SUCCESS",
@@ -186,7 +170,7 @@ class OmniGPUWorkerBase(GPUWorker):
             logger.error(f"[LLM Worker {self.rank}] Sleep Task Failed: {e}")
             return OmniACK(task_id=task.task_id, status="ERROR", error_msg=str(e))
 
-    def handle_wake_task(self, task: OmniWakeTask) -> None:
+    def handle_wake_task(self, task: OmniWakeTask) -> OmniACK:
         "Handle deterministic Wakeup command from the main process"
         try:
             if isinstance(task, dict):

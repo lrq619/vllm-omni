@@ -1,4 +1,5 @@
 from typing import Any
+import inspect
 
 from typing_extensions import assert_never
 from vllm.inputs.data import SingletonInputs, SingletonPrompt
@@ -18,6 +19,24 @@ logger = init_logger(__name__)
 
 
 class OmniInputPreprocessor(InputPreprocessor):
+    def __init__(
+        self,
+        vllm_config,
+        tokenizer,
+        mm_registry,
+        mm_processor_cache=None,
+        **kwargs
+    ):
+        sig = inspect.signature(super().__init__)
+        if 'mm_processor_cache' in sig.parameters:
+            super().__init__(vllm_config, tokenizer, mm_registry, 
+                             mm_processor_cache=mm_processor_cache, **kwargs)
+        else:
+            super().__init__(vllm_config, tokenizer, mm_registry, **kwargs)
+        self.mm_processor_cache = mm_processor_cache
+        self.model_config = vllm_config.model_config
+
+
     """Input preprocessor for omni models.
 
     Extends the base InputPreprocessor to handle omni-specific input

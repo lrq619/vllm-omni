@@ -1,4 +1,5 @@
 import os
+import inspect
 import time
 from collections.abc import Mapping
 from typing import Any, cast
@@ -78,13 +79,27 @@ class OmniInputProcessor(InputProcessor):
         self,
         vllm_config: VllmConfig,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
+        tokenizer: Any = None,
+        mm_processor_cache=None,
+        **kwargs
     ):
-        super().__init__(vllm_config, mm_registry)
+        sig = inspect.signature(super().__init__)
+        base_params = {
+            "vllm_config": vllm_config,
+            "mm_registry": mm_registry,
+        }
+        super().__init__(**{k: v for k, v in base_params.items() if k in sig.parameters})
+
+        self._tokenizer_override = tokenizer
+        mm_processor_cache = getattr(self.vllm_config.model_config, "mm_processor_cache", None)
+        if mm_processor_cache is None and hasattr(self.vllm_config, "cache_config"):
+             mm_processor_cache = getattr(self.vllm_config.cache_config, "mm_processor_cache", None)
+        
         self.input_preprocessor = OmniInputPreprocessor(
-            self.model_config,
+            self.vllm_config,
             self.tokenizer,
             mm_registry,
-            mm_processor_cache=self.mm_processor_cache,
+            mm_processor_cache=mm_processor_cache,
         )
 
     def process_inputs(
@@ -283,3 +298,12 @@ class OmniInputProcessor(InputProcessor):
         arr = np.frombuffer(payload.data, dtype=dtype)
         arr = arr.reshape(payload.shape)
         return torch.from_numpy(arr)
+
+    @property
+    def tokenizer(self) -> Any:
+        if self._tokenizer_override is not None:
+            return self._tokenizer_override
+        try:
+            return super().tokenizer
+        except AttributeError:
+            return None

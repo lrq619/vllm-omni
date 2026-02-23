@@ -181,36 +181,21 @@ class DiffusionWorker:
 
     def sleep(self, level: int = 1) -> bool:
         """
-        Put the worker to sleep, offloading model weights.
-
+        Put the worker to sleep.
         Args:
-            level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
+            level: 1 (Offload weights to CPU), level: 2 (Total Discard).
         """
         from vllm.device_allocator.cumem import CuMemAllocator
-        import torch
-        
-        initial_allocated = torch.cuda.memory_allocated(self.device)
-
-        # Save the buffers before level 2 sleep
-        if level == 2 and self.model_runner is not None:
-            model = self.model_runner.pipeline
-            self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
-
+        mem_before = current_omni_platform.get_current_memory_usage(self.device)
+        offload_tags = ("weights",) if level == 1 else tuple()
         allocator = CuMemAllocator.get_instance()
-        allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
-
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
-        final_allocated = torch.cuda.memory_allocated(self.device)
-        freed_gb = (initial_allocated - final_allocated) / 1024**3
-        remaining_gb = final_allocated / 1024**3
-
-        logger.info(
-            'Sleep mode freed %.2f GiB memory, %.2f GiB memory is still in use.',
-            freed_gb, 
-            remaining_gb
-        )
+        allocator.sleep(offload_tags=offload_tags)
+        current_omni_platform.empty_cache()
+        current_omni_platform.synchronize()
+        mem_after = current_omni_platform.get_current_memory_usage(self.device)
+        freed = mem_before - mem_after
+        remaining_gb = mem_after / 1024**3
+        logger.info(f"[Diffusion Worker {self.rank}] Level {level} Sleep: Freed {freed / 1024**3:.2f} GiB. {remaining_gb:.2f}GiB memory is still in use.")
         return True
 
     def wake_up(self, tags: list[str] | None = None) -> bool:
@@ -226,17 +211,10 @@ class DiffusionWorker:
                 worker is used again.
         """
         from vllm.device_allocator.cumem import CuMemAllocator
-
         allocator = CuMemAllocator.get_instance()
         allocator.wake_up(tags)
-
-        # Restore the buffers after level 2 sleep
-        if len(self._sleep_saved_buffers) and self.model_runner is not None:
-            model = self.model_runner.pipeline
-            for name, buffer in model.named_buffers():
-                if name in self._sleep_saved_buffers:
-                    buffer.data.copy_(self._sleep_saved_buffers[name].data)
-            self._sleep_saved_buffers = {}
+        current_omni_platform.synchronize()
+        logger.info(f"[Diffusion Worker {self.rank}] Wake-up complete.")
         return True
 
     def handle_sleep_task(self, task: OmniSleepTask) -> OmniACK:
@@ -247,32 +225,25 @@ class DiffusionWorker:
         3. Emitter a physical acknowledgment (ACK) signal
         """
         try:
-            from vllm.device_allocator.cumem import CuMemAllocator
-            allocator = CuMemAllocator.get_instance()
-
             logger.info(f"[Diffusion Worker {self.rank}] Handshake Received: Task {task.task_id}, Level {task.level}")
-
             if task.level >= 2:
                 if hasattr(self.model_runner, "graph_runners"):
                     self.model_runner.graph_runners.clear()
-                    logger.info(f"[Diffusion Worker {self.rank}] CUDA Graph runners cleared.")
+                    logger.info(f"[Diffusion Worker {self.rank}] CUDA/HIP Graphs cleared.")
 
-                self.sleep(level=task.level)
-
-            freed_bytes = allocator.get_last_freed_bytes() if hasattr(allocator, "get_last_freed_bytes") else 0
-            if freed_bytes == 0:
-                freed_bytes = int(14.87 * 1024**3)
-
+            mem_before = current_omni_platform.get_current_memory_usage(self.device)
+            self.sleep(level=task.level)
+            mem_after = current_omni_platform.get_current_memory_usage(self.device)
+            real_freed = max(0, mem_before - mem_after)
             ack = OmniACK(
                 task_id=task.task_id,
                 status="SUCCESS",
                 stage_id=self.stage_id,
                 rank=self.rank,
-                freed_bytes=freed_bytes,
-                metadata={"cuda_graph_cleaned": task.level >= 2}
+                freed_bytes=real_freed,
+                metadata={"vram_after": mem_after}
             )
-
-            logger.info(f"[Diffusion Worker {self.rank}]: ACK emitted. Freed {freed_bytes / 1024**3:.2f} GiB.")
+            logger.info(f"[Diffusion Worker {self.rank}]: ACK emitted. Freed {real_freed / 1024**3:.2f} GiB.")
             return ack
 
         except Exception as e:
