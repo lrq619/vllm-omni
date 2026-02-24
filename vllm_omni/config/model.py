@@ -1,28 +1,14 @@
-import warnings
-from dataclasses import field
-from typing import Any
-
-import torch
 from pydantic import ConfigDict
 from pydantic.dataclasses import dataclass
-from vllm.config import ModelConfig, config
-from vllm.config.model import (
-    _RUNNER_CONVERTS,
-    _get_and_verify_dtype,
-    get_served_model_name,
-)
-from vllm.config.multimodal import MMCacheType, MMEncoderTPMode, MultiModalConfig
-from vllm.config.pooler import PoolerConfig
+from dataclasses import field
+from typing import Any, Optional, Union
+
+from pydantic import ConfigDict
+from vllm.config import ModelConfig
+from vllm.config.multimodal import MMCacheType, MMEncoderTPMode
+from vllm.config.utils import config
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
-from vllm.transformers_utils.config import (
-    get_config,
-    get_hf_image_processor_config,
-    get_hf_text_config,
-    get_pooling_config,
-)
-from vllm.transformers_utils.gguf_utils import is_gguf, maybe_patch_hf_config_from_gguf
-from vllm.transformers_utils.utils import maybe_model_redirect
+from vllm.transformers_utils.config import get_hf_text_config
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 import vllm_omni.model_executor.models as me_models
@@ -45,6 +31,7 @@ class OmniModelConfig(ModelConfig):
             (default: "thinker")
         model_arch: Model architecture name
             (default: "Qwen2_5OmniForConditionalGeneration")
+        worker_type: Model Type, e.g., "ar" or "generation"
         engine_output_type: Optional output type specification for the engine.
             Used to route outputs to appropriate processors (e.g., "image",
             "audio", "latents"). If None, output type is inferred.
@@ -63,11 +50,13 @@ class OmniModelConfig(ModelConfig):
     async_chunk: bool = False
     model_stage: str = "thinker"
     model_arch: str = "Qwen2_5OmniForConditionalGeneration"
+    worker_type: str | None = None
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_config: dict[str, Any] = None
     omni_kv_config: dict | None = None
+    codec_frame_rate_hz: float | None = None
 
     mm_encoder_tp_mode: Any = "weights"
 
@@ -82,6 +71,15 @@ class OmniModelConfig(ModelConfig):
     @property
     def architectures(self) -> list[str]:
         return [self.model_arch]
+
+    @property
+    def embedding_size(self):
+        if self.hf_config_name is not None:
+            stage_config = getattr(self.hf_config, self.hf_config_name, None)
+            override = getattr(stage_config, "embedding_size", None)
+            if override is not None:
+                return override
+        return super().embedding_size
 
     def draw_hf_text_config(self):
         # transformers' get_text_config method is used to get the text config from thinker_config.
@@ -189,17 +187,37 @@ class OmniModelConfig(ModelConfig):
             self.model,
             hf_config,
         )
-
-        self.hf_config = hf_config
-        if dict_overrides:
-            self._apply_dict_overrides(hf_config, dict_overrides)
-        self.hf_text_config = self.draw_hf_text_config()
-        self.attention_chunk_size = getattr(self.hf_text_config, "attention_chunk_size", None)
-        self.encoder_config = self._get_encoder_config()
-        self.hf_image_processor_config = get_hf_image_processor_config(
-            self.model, hf_token=self.hf_token, revision=self.revision
+        # Call parent's __post_init__ to handle all standard ModelConfig initialization
+        super().__post_init__(
+            limit_mm_per_prompt=limit_mm_per_prompt,
+            enable_mm_embeds=enable_mm_embeds,
+            media_io_kwargs=media_io_kwargs,
+            mm_processor_kwargs=mm_processor_kwargs,
+            mm_processor_cache_gb=mm_processor_cache_gb,
+            mm_processor_cache_type=mm_processor_cache_type,
+            mm_shm_cache_max_object_size_mb=mm_shm_cache_max_object_size_mb,
+            mm_encoder_only=mm_encoder_only,
+            mm_encoder_tp_mode=mm_encoder_tp_mode,
+            mm_encoder_attn_backend=mm_encoder_attn_backend,
+            interleave_mm_strings=interleave_mm_strings,
+            skip_mm_profiling=skip_mm_profiling,
+            video_pruning_rate=video_pruning_rate,
         )
-        self.model_arch_config = self.get_model_arch_config()
+
+        # Qwen3-TTS: infer codec frame rate from the model config for online serving.
+        if self.codec_frame_rate_hz is None and self.model_arch == "Qwen3TTSTalkerForConditionalGenerationARVLLM":
+            talker_cfg = getattr(self.hf_config, "talker_config", None)
+            if isinstance(talker_cfg, dict):
+                pos_per_sec = talker_cfg.get("position_id_per_seconds")
+            else:
+                pos_per_sec = getattr(talker_cfg, "position_id_per_seconds", None)
+            if pos_per_sec is not None:
+                try:
+                    fps = float(pos_per_sec)
+                except Exception:
+                    fps = None
+                if fps is not None and fps > 0:
+                    self.codec_frame_rate_hz = fps
 
         if self.convert == "mm_encoder_only":
             logger.warning_once(
@@ -327,3 +345,15 @@ class OmniModelConfig(ModelConfig):
         self._verify_quantization()
         self._verify_cuda_graph()
         self._verify_bnb_config()
+        # Override hf_text_config with omni-specific logic for multi-stage models
+        # (e.g., thinker_config, talker_config)
+        new_hf_text_config = self.draw_hf_text_config()
+        if new_hf_text_config is not self.hf_text_config:
+            self.hf_text_config = new_hf_text_config
+            # Recalculate dependent attributes
+            self.attention_chunk_size = getattr(self.hf_text_config, "attention_chunk_size", None)
+            # Recalculate max_model_len since it depends on hf_text_config
+            self.max_model_len = self.get_and_verify_max_len(self.original_max_model_len)
+            # Reset sliding_window if needed
+            if self.disable_sliding_window:
+                self.hf_text_config.sliding_window = None

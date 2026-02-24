@@ -12,17 +12,20 @@ from vllm.inputs.parse import split_enc_dec_inputs
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalUUIDDict
-from contextlib import contextmanager
 try:
-    from vllm.multimodal.processing.context import set_request_id
-except (ImportError, ModuleNotFoundError):
+    from vllm.multimodal.processing import set_request_id
+except ImportError:  # vllm without set_request_id (older releases)
+    from contextlib import contextmanager
+
     @contextmanager
-    def set_request_id(request_id: str):
+    def set_request_id(_request_id: str):
         yield
 from vllm.multimodal.utils import argsort_mm_positions
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
+from vllm.renderers.inputs import DictPrompt, TokPrompt
 from vllm.sampling_params import SamplingParams
+from vllm.tasks import SupportedTask
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine.input_processor import InputProcessor
@@ -116,7 +119,7 @@ class OmniInputProcessor(InputProcessor):
     def process_inputs(
         self,
         request_id: str,
-        prompt: PromptType,
+        prompt: PromptType | DictPrompt | TokPrompt,
         params: SamplingParams | PoolingParams,
         arrival_time: float | None = None,
         lora_request: LoRARequest | None = None,
@@ -124,6 +127,7 @@ class OmniInputProcessor(InputProcessor):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        supported_tasks: tuple[SupportedTask, ...] | None = None,
         resumable: bool = False,
     ) -> OmniEngineCoreRequest:
         """Process input prompt into an engine core request.
@@ -156,7 +160,7 @@ class OmniInputProcessor(InputProcessor):
                 has incorrect shape
         """
         self._validate_lora(lora_request)
-        self._validate_params(params)
+        self._validate_params(params, supported_tasks)
 
         parallel_config = self.vllm_config.parallel_config
 

@@ -236,6 +236,40 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
     return stage_args
 
 
+def load_and_resolve_stage_configs(
+    model: str,
+    stage_configs_path: str | None,
+    base_engine_args: dict | None,
+    default_stage_cfg_factory: Any = None,
+) -> tuple[str, list]:
+    """Load stage configurations from model or YAML file with fallback to defaults.
+
+    Args:
+        model: Model name or path
+        stage_configs_path: Optional path to YAML file containing stage configurations
+        base_engine_args: Base engine arguments to merge with stage configs
+        default_stage_cfg_factory: Optional callable that takes no args and returns
+            default stage config list when no configs are found
+
+    Returns:
+        Tuple of (config_path, stage_configs)
+    """
+    if stage_configs_path is None:
+        config_path = resolve_model_config_path(model)
+        stage_configs = load_stage_configs_from_model(model, base_engine_args=base_engine_args)
+        if not stage_configs:
+            if default_stage_cfg_factory is not None:
+                default_stage_cfg = default_stage_cfg_factory()
+                stage_configs = OmegaConf.create(default_stage_cfg)
+            else:
+                stage_configs = []
+    else:
+        config_path = stage_configs_path
+        stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=base_engine_args)
+
+    return config_path, stage_configs
+
+
 def get_final_stage_id_for_e2e(
     output_modalities: list[str] | None, default_modalities: list[str], stage_list: list
 ) -> int:
@@ -280,3 +314,111 @@ def get_final_stage_id_for_e2e(
         final_stage_id_for_e2e = last_stage_id
 
     return final_stage_id_for_e2e
+
+
+# TODO(wuhang): Remove after PR #1115.
+def build_base_engine_args(source: Any) -> dict[str, Any] | None:
+    """Build base engine args with tokenizer and parallel configuration.
+
+    Automatically detects whether source is a dict-like object or namespace object.
+
+    Args:
+        source: Source object (args namespace or kwargs dict) containing configuration.
+
+    Returns:
+        Dictionary containing tokenizer and parallel configuration overrides,
+        or None if no configuration is present.
+    """
+    # Auto-detect source type: dict-like objects have 'get' method
+    is_dict_like = hasattr(source, "get") and callable(getattr(source, "get"))
+
+    # Extract tokenizer
+    if is_dict_like:
+        tokenizer = source.get("tokenizer", None)
+    else:
+        tokenizer = getattr(source, "tokenizer", None)
+
+    base_engine_args = {"tokenizer": tokenizer} if tokenizer is not None else None
+
+    # Extract parallel configuration
+    parallel_keys = [
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "data_parallel_size",
+        "data_parallel_size_local",
+        "data_parallel_backend",
+        "distributed_executor_backend",
+    ]
+
+    if is_dict_like:
+        parallel_overrides = {k: source[k] for k in parallel_keys if k in source and source[k] is not None}
+    else:
+        parallel_overrides = {
+            k: getattr(source, k) for k in parallel_keys if hasattr(source, k) and getattr(source, k) is not None
+        }
+
+    if parallel_overrides:
+        base_engine_args = base_engine_args or {}
+        base_engine_args.update(parallel_overrides)
+
+    return base_engine_args
+
+
+# The following code detects if the process is running in a container and if
+# PID host is available. If so, we can use process-scoped memory tracking;
+# otherwise we need sequential init locks.
+
+
+def _read_text(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+
+def in_container() -> bool:
+    # Common Docker signal
+    if os.path.exists("/.dockerenv"):
+        return True
+
+    # cgroup markers (works for Docker/containerd/K8s/Podman in many setups)
+    cg = _read_text("/proc/1/cgroup") or ""
+    markers = ("docker", "containerd", "kubepods", "libpod", "podman")
+    return any(m in cg for m in markers)
+
+
+def has_pid_host() -> bool | None:
+    """
+    Returns:
+      True  -> very likely running with --pid=host (host PID namespace)
+      False -> very likely isolated PID namespace (default)
+      None  -> cannot determine
+    """
+    # Strong signal: in host pid namespace, PID 2 is usually kthreadd
+    comm2 = _read_text("/proc/2/comm")
+    if comm2 is not None:
+        comm2 = comm2.strip()
+        if comm2 == "kthreadd":
+            return True
+        # If PID 2 exists and is NOT kthreadd, we're almost certainly not in host pid ns
+        return False
+
+    # Fallback: check for other low-numbered kernel threads (best-effort)
+    for pid, name in [(3, "rcu_gp"), (4, "rcu_par_gp"), (10, "ksoftirqd/0")]:
+        comm = _read_text(f"/proc/{pid}/comm")
+        if comm is not None:
+            if comm.strip() == name:
+                return True
+            else:
+                return False
+
+    return False
+
+
+def detect_pid_host() -> bool:
+    ic = in_container()
+    if not ic:
+        return True
+
+    return has_pid_host()

@@ -33,13 +33,13 @@ from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 
 # Internal imports (our code)
 from vllm_omni.lora.request import LoRARequest
-from vllm_omni.metrics import OrchestratorAggregator, StageRequestStats
+from vllm_omni.metrics import OrchestratorAggregator
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
 
-def _weak_close_cleanup_async(stage_list, stage_in_queues, ray_pg, output_handler):
+def _weak_close_cleanup_async(stage_list, stage_in_queues, stage_out_queues, ray_pg, output_handler, zmq_ctx=None):
     """Weak reference cleanup function for AsyncOmni instances."""
     if stage_list:
         for q in stage_in_queues:
@@ -47,6 +47,13 @@ def _weak_close_cleanup_async(stage_list, stage_in_queues, ray_pg, output_handle
                 q.put_nowait(SHUTDOWN_TASK)
             except Exception as e:
                 logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
+            close_fn = getattr(q, "close", None)
+            if callable(close_fn):
+                close_fn()
+        for q in stage_out_queues:
+            close_fn = getattr(q, "close", None)
+            if callable(close_fn):
+                close_fn()
         for stage in stage_list:
             try:
                 stage.stop_stage_worker()
@@ -56,6 +63,8 @@ def _weak_close_cleanup_async(stage_list, stage_in_queues, ray_pg, output_handle
     # Cancel output handler
     if output_handler is not None:
         output_handler.cancel()
+    if zmq_ctx is not None:
+        zmq_ctx.term()
 
 class AsyncEventResolver:
     """
@@ -165,8 +174,10 @@ class AsyncOmni(OmniBase):
             _weak_close_cleanup_async,
             self.stage_list,
             self._stage_in_queues,
+            self._stage_out_queues,
             self._ray_pg,
             self.output_handler,
+            self._zmq_ctx,
         )
 
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -219,8 +230,9 @@ class AsyncOmni(OmniBase):
                     "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
                     "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
                     "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
-                    "layerwise_num_gpu_layers": kwargs.get("layerwise_num_gpu_layers", False),
                     "enforce_eager": kwargs.get("enforce_eager", False),
+                    "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
+                    "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
                 },
                 "final_output": True,
                 "final_output_type": "image",
@@ -452,7 +464,8 @@ class AsyncOmni(OmniBase):
                     submit_flag = False
                     prompt_token_ids = engine_outputs.prompt_token_ids
                     engine_input = copy.deepcopy(prompt)
-                    engine_input["prompt_token_ids"] = [0] * compute_talker_prompt_ids_length(prompt_token_ids)
+                    next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+                    engine_input["prompt_token_ids"] = [0] * next_prompt_len
                     engine_input["multi_modal_data"] = engine_input["mm_processor_kwargs"] = None
                     for i in range(1, len(self.stage_list)):
                         task = {
@@ -465,9 +478,6 @@ class AsyncOmni(OmniBase):
                 all_stages_finished[stage_id] = finished
 
                 if output_to_yield:
-                    metrics.record_audio_generated_frames(
-                        output_to_yield, engine_outputs.finished, stage_id, request_id
-                    )
                     yield output_to_yield
 
     async def _process_sequential_results(
@@ -491,9 +501,6 @@ class AsyncOmni(OmniBase):
                     metrics,
                 )
                 if output_to_yield:
-                    metrics.record_audio_generated_frames(
-                        output_to_yield, engine_outputs.finished, stage_id, request_id
-                    )
                     yield output_to_yield
             if not isinstance(engine_outputs, list):
                 engine_outputs = [engine_outputs]
@@ -567,29 +574,6 @@ class AsyncOmni(OmniBase):
 
         finished = engine_outputs.finished
 
-        # Mark last output time
-        metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
-
-        try:
-            _m: StageRequestStats = result.get("metrics")
-            if _m is not None:
-                # Accumulate generation time
-                metrics.accumulated_gen_time_ms[req_id][stage_id] += _m.stage_gen_time_ms
-
-                # For diffusion stages, we also accumulate diffusion time
-                metrics.accumulate_diffusion_metrics(stage.stage_type, req_id, engine_outputs)
-
-                if finished:
-                    metrics.on_stage_metrics(stage_id, req_id, _m, stage.final_output_type)
-        except Exception as e:
-            logger.exception(
-                f"[{self._name}] Failed to process metrics for stage {stage_id}, req {req_id}: {e}",
-            )
-
-        logger.debug(
-            f"[{self._name}] Stage-{stage_id} completed request {req_id}; forwarding or finalizing",
-        )
-
         output_to_yield = None
 
         if getattr(stage, "final_output", False):
@@ -614,6 +598,23 @@ class AsyncOmni(OmniBase):
                     final_output_type=stage.final_output_type,
                     request_output=engine_outputs,
                 )
+        # Mark last output time
+        metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
+
+        metrics.process_stage_metrics(
+            result=result,
+            stage_type=stage.stage_type,
+            stage_id=stage_id,
+            req_id=req_id,
+            engine_outputs=engine_outputs,
+            finished=finished,
+            final_output_type=stage.final_output_type,
+            output_to_yield=output_to_yield,
+        )
+
+        logger.debug(
+            f"[{self._name}] Stage-{stage_id} completed request {req_id}; forwarding or finalizing",
+        )
 
         return engine_outputs, finished, output_to_yield
 

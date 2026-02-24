@@ -137,6 +137,7 @@ warn_unreachable = true
 strict_equality = true
 
 [tool.pytest.ini_options]
+asyncio_mode = "auto"
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test*"]
@@ -147,7 +148,8 @@ addopts = [
 ]
 markers = [
     # ci/cd required
-    "core_model: Core model tests (run in each PR)",
+    "core_model: L1&L2 tests (run in each PR)",
+    "advanced_model: L3&L4 level tests (run in each merge or nightly)",
     # function module markers
     "diffusion: Diffusion model tests",
     "omni: Omni model tests",
@@ -192,6 +194,6 @@ extend-ignore-identifiers-re = [
     ".*nothink.*",
     ".*NOTHINK.*",
     ".*nin.*",
-    "Ono_Anna",
+    ".*[Oo]no_[Aa]nna.*",
     ".*cann.*",
 ]
