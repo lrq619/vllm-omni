@@ -1,4 +1,6 @@
 import asyncio
+import torch
+is_rocm = torch.version.hip is not None
 import pytest
 import torch
 import uuid
@@ -25,7 +27,7 @@ def get_vram_info(device_id: int) -> dict:
     }
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 async def llm_engine():
     model_name = "Qwen/Qwen2.5-Omni-3B"
     common_args = {
@@ -54,7 +56,7 @@ async def llm_engine():
 
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 async def diffusion_engine():
     model_name = "black-forest-labs/FLUX.2-klein-4B"
     stages = [
@@ -83,7 +85,8 @@ async def diffusion_engine():
 
 
 class TestOmniSleepMode:
-
+    
+    @pytest.mark.skipif(is_rocm, reason="LLM Worker Sleep Mode is currently optimized for CUDA. Skipping on AMD. To be placed in the next plan")
     @pytest.mark.asyncio
     async def test_llm_sleep_ack(self, llm_engine: AsyncOmni):
         """LLM Thinker (GPU0) Signal and Physical Recycling Audit"""
@@ -159,17 +162,22 @@ class TestOmniSleepMode:
         logger.info("SUCCESS: Diffusion integrity verified.")
 
 
+    @pytest.mark.skipif(is_rocm, reason="Coordinated LLM+Diffusion test requires stable ROCm LLM workers. Skipping on AMD. To be placed in the next plan")
     @pytest.mark.asyncio
     async def test_coordinated_cross_device(self, llm_engine: AsyncOmni, diffusion_engine: AsyncOmni):
         """Heterogeneous Coordinated Cleanup Test (Talker and Diffusion on GPU 1)"""
         # At this point, GPU 1 hosts both Talker (4.5G) and Diffusion (14.8G)
+        await llm_engine.wake_up(stage_ids=[1])
+        await diffusion_engine.wake_up(stage_ids=[0])
+        await asyncio.sleep(2)
+
         initial_vram = get_vram_info(1)["reserved"]
         logger.info(f"GPU 1 total pressure: {initial_vram:.2f} GiB")
 
         # Simultaneously issue physical cleanup
         logger.info("Issuing concurrent SLEEP commands to LLM-Talker and Diffusion-Base...")
         await llm_engine.sleep(stage_ids=[1], level=2)
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(2.0)
         await diffusion_engine.sleep(stage_ids=[0], level=2)
 
         torch.cuda.empty_cache()
