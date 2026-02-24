@@ -105,7 +105,7 @@ class TestOmniSleepMode:
     async def test_diffusion_sleep_handshake(self, diffusion_engine: AsyncOmni):
         """Diffusion Worker stage signal loop"""
         logger.info("Starting Diffusion Worker Handshake Test")
-        acks = await diffusion_engine.sleep(stage_ids=[0], level=1)
+        acks = await diffusion_engine.sleep(stage_ids=[0], level=2)
         assert all(ack.status == "SUCCESS" for ack in acks)
         logger.info(f"Success: Received {len(acks)} Diffusion Worker ACKs")
 
@@ -113,7 +113,7 @@ class TestOmniSleepMode:
     @pytest.mark.asyncio
     async def test_cross_device_cleanup(self, diffusion_engine: AsyncOmni):
         """Physical recycling audit: leveraging deterministic data returned by Workers"""
-        acks = await diffusion_engine.sleep(stage_ids=[0], level=1)
+        acks = await diffusion_engine.sleep(stage_ids=[0], level=2)
         # Sum up the release amounts reported by all Workers.
         total_freed_bytes = sum(getattr(ack, "freed_bytes", 0) for ack in acks)
         freed_gb = total_freed_bytes / 1024**3
@@ -142,7 +142,7 @@ class TestOmniSleepMode:
 
         # Deep Sleep (Level 2)
         logger.info("Step 2: Entering Deep Sleep...")
-        await diffusion_engine.sleep(stage_ids=[0], level=1)
+        await diffusion_engine.sleep(stage_ids=[0], level=2)
         # Physical Wake-up
         logger.info("Step 3: Waking up...")
         await diffusion_engine.wake_up(stage_ids=[0])
@@ -197,7 +197,7 @@ class TestOmniSleepMode:
         
         # level 2
         logger.info("Triggering Level 2 Deep Sleep (Weight Offloading)...")
-        acks = await diffusion_engine.sleep(stage_ids=[0], level=1)
+        acks = await diffusion_engine.sleep(stage_ids=[0], level=2)
         
         total_freed = sum(getattr(ack, "freed_bytes", 0) for ack in acks) / 1024**3
         logger.info(f"Worker reported freed: {total_freed:.2f} GiB")

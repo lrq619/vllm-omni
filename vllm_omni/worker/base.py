@@ -22,6 +22,7 @@ from vllm_omni.diffusion.data import (
 )
 
 from vllm_omni.platforms import current_omni_platform
+from contextlib import AbstractContextManager, nullcontext
 
 logger = init_logger(__name__)
 
@@ -112,18 +113,39 @@ class OmniGPUWorkerBase(GPUWorker):
         return int(self.available_kv_cache_memory_bytes)
 
 
+    def load_model(self):
+        """Identify LLM weights"""
+        with self._maybe_get_memory_pool_context("weights"):
+            super().load_model()
+
+    # Provide memory pool context
+    def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
+        # enable sleep mode
+        if getattr(self.cache_config, "enable_sleep_mode", False) or \
+           getattr(self.model_config, "enable_sleep_mode", False):
+            from vllm.device_allocator.cumem import CuMemAllocator
+            allocator = CuMemAllocator.get_instance()
+            return allocator.use_memory_pool(tag=tag)
+        return nullcontext()
+
+
     def sleep(self, level: int = 1) -> bool:
-        "Physical video memory unloading logic"
+        """
+        Put the worker to sleep.
+        Args:
+            level: 1 (Offload weights to CPU), level: 2 (Total Discard).
+        """
         from vllm.device_allocator.cumem import CuMemAllocator
         mem_before = current_omni_platform.get_current_memory_usage(self.device)
+        offload_tags = ("weights") if level == 1 else tuple()
         allocator = CuMemAllocator.get_instance()
-        offload_tags = ("weights",) if level == 1 else tuple()
         allocator.sleep(offload_tags=offload_tags)
         current_omni_platform.empty_cache()
         current_omni_platform.synchronize()
         mem_after = current_omni_platform.get_current_memory_usage(self.device)
-        freed = mem_before - mem_after
-        logger.info(f"[LLM Worker {self.rank}] Sleep mode freed {freed / 1024**3:.2f} GiB.")
+        freed = max(0, mem_before - mem_after)
+        remaining_gb = mem_after / 1024**3
+        logger.info(f"[LLM Worker {self.rank}] Level {level} Sleep: Freed {freed / 1024**3:.2f} GiB. {remaining_gb:.2f}GiB memory is still in use.")
         return True
 
     def wake_up(self, tags: list[str] | None = None) -> bool:

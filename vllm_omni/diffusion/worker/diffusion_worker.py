@@ -187,13 +187,13 @@ class DiffusionWorker:
         """
         from vllm.device_allocator.cumem import CuMemAllocator
         mem_before = current_omni_platform.get_current_memory_usage(self.device)
-        offload_tags = ("weights",) if level == 1 else tuple()
+        offload_tags = ("weights", "default") if level == 1 else tuple()
         allocator = CuMemAllocator.get_instance()
         allocator.sleep(offload_tags=offload_tags)
         current_omni_platform.empty_cache()
         current_omni_platform.synchronize()
         mem_after = current_omni_platform.get_current_memory_usage(self.device)
-        freed = mem_before - mem_after
+        freed = max(0, mem_before - mem_after)
         remaining_gb = mem_after / 1024**3
         logger.info(f"[Diffusion Worker {self.rank}] Level {level} Sleep: Freed {freed / 1024**3:.2f} GiB. {remaining_gb:.2f}GiB memory is still in use.")
         return True
@@ -202,13 +202,6 @@ class DiffusionWorker:
         """
         Wake up the worker from sleep mode. See the sleep function
         method for more details.
-
-        Args:
-            tags: An optional list of tags to reallocate the worker memory
-                for specific memory allocations. Values must be in
-                `("weights")`. If None, all memory is reallocated.
-                wake_up should be called with all tags (or None) before the
-                worker is used again.
         """
         from vllm.device_allocator.cumem import CuMemAllocator
         allocator = CuMemAllocator.get_instance()

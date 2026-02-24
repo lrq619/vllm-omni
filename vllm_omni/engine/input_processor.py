@@ -84,13 +84,18 @@ class OmniInputProcessor(InputProcessor):
         **kwargs
     ):
         sig = inspect.signature(super().__init__)
+        actual_tokenizer = tokenizer or getattr(vllm_config.model_config, "tokenizer", None)
         base_params = {
             "vllm_config": vllm_config,
             "mm_registry": mm_registry,
+            "tokenizer": actual_tokenizer,
         }
-        super().__init__(**{k: v for k, v in base_params.items() if k in sig.parameters})
+        super().__init__(
+            tokenizer=actual_tokenizer, 
+            **{k: v for k, v in base_params.items() if k in sig.parameters and k != 'tokenizer'}
+        )
 
-        self._tokenizer_override = tokenizer
+        self._tokenizer_override = actual_tokenizer
         mm_processor_cache = getattr(self.vllm_config.model_config, "mm_processor_cache", None)
         if mm_processor_cache is None and hasattr(self.vllm_config, "cache_config"):
              mm_processor_cache = getattr(self.vllm_config.cache_config, "mm_processor_cache", None)
