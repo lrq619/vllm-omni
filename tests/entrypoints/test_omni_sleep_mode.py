@@ -127,7 +127,7 @@ class TestOmniSleepMode:
     @pytest.mark.asyncio
     async def test_diffusion_integrity_bit_level(self, diffusion_engine: AsyncOmni):
         """Bit-level consistency after Diffusion wake-up (prevent image corruption)"""
-        prompt = "A high-tech lab in Kuala Lumpur"
+        prompt = "A huge swimming pool, with many people swimming."
         sp = OmniDiffusionSamplingParams(
             num_inference_steps=4, 
             height=512, 
@@ -135,20 +135,20 @@ class TestOmniSleepMode:
         )
        
         # Baseline Generation
-        logger.info("Step 1: Running Baseline Generation...")
+        logger.info("Running Baseline Generation...")
         base_output = None
         async for output in diffusion_engine.generate(prompt, request_id="base", sampling_params_list=[sp]):
             base_output = output
 
         # Deep Sleep (Level 2)
-        logger.info("Step 2: Entering Deep Sleep...")
+        logger.info("Entering Deep Sleep...")
         await diffusion_engine.sleep(stage_ids=[0], level=2)
         # Physical Wake-up
-        logger.info("Step 3: Waking up...")
+        logger.info("Waking up...")
         await diffusion_engine.wake_up(stage_ids=[0])
 
         # Post-Wakeup Generation
-        logger.info("Step 4: Running Post-Wakeup Generation...")
+        logger.info("Running Post-Wakeup Generation...")
         post_output = None
         async for output in diffusion_engine.generate(prompt, request_id="post", sampling_params_list=[sp]):
             post_output = output
@@ -221,7 +221,7 @@ class TestOmniSleepMode:
         assert abs(vram_restored - vram_initial) < 2.0, "VRAM failed to restore correctly"
         
         logger.info("Running final smoke test generation...")
-        prompt = "Kuala Lumpur skyline at night"
+        prompt = "A huge swimming pool, with many people swimming."
         sp = OmniDiffusionSamplingParams(num_inference_steps=2, height=512, width=512)
         async for output in diffusion_engine.generate(prompt, request_id="lifecycle-check", sampling_params_list=[sp]):
             assert output.images[0] is not None
