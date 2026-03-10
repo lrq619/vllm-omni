@@ -149,6 +149,14 @@ class DiffusionEngine:
                         prompt=prompt,
                         metrics=metrics,
                         latents=output.trajectory_latents,
+                        multimodal_output={
+                            "all_latents": output.all_latents,
+                            "all_timesteps": output.all_timesteps,
+                            "prompt_embeds": output.prompt_embeds,
+                            "prompt_embeds_mask": output.prompt_embeds_mask,
+                            "negative_prompt_embeds": output.negative_prompt_embeds,
+                            "negative_prompt_embeds_mask": output.negative_prompt_embeds_mask
+                        }
                     ),
                 ]
         else:

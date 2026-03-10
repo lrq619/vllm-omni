@@ -539,6 +539,13 @@ class DiffusionOutput:
     trajectory_latents: torch.Tensor | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
+    all_latents: torch.Tensor | None = None
+    all_log_probs: torch.Tensor | None = None
+    all_timesteps: torch.Tensor | None = None
+    prompt_embeds: torch.Tensor | None = None
+    prompt_embeds_mask: torch.Tensor | None = None
+    negative_prompt_embeds: torch.Tensor | None = None
+    negative_prompt_embeds_mask: torch.Tensor | None = None
 
     post_process_func: Callable[..., Any] | None = None
 
