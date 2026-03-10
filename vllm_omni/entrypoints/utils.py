@@ -318,7 +318,7 @@ def get_final_stage_id_for_e2e(
 
 # TODO(wuhang): Remove after PR #1115.
 def build_base_engine_args(source: Any) -> dict[str, Any] | None:
-    """Build base engine args with tokenizer and parallel configuration.
+    """Build base engine args with tokenizer and shared engine overrides.
 
     Automatically detects whether source is a dict-like object or namespace object.
 
@@ -326,7 +326,7 @@ def build_base_engine_args(source: Any) -> dict[str, Any] | None:
         source: Source object (args namespace or kwargs dict) containing configuration.
 
     Returns:
-        Dictionary containing tokenizer and parallel configuration overrides,
+        Dictionary containing tokenizer and shared configuration overrides,
         or None if no configuration is present.
     """
     # Auto-detect source type: dict-like objects have 'get' method
@@ -360,6 +360,21 @@ def build_base_engine_args(source: Any) -> dict[str, Any] | None:
     if parallel_overrides:
         base_engine_args = base_engine_args or {}
         base_engine_args.update(parallel_overrides)
+
+    # Extract shared overrides that should apply to all stages when provided.
+    shared_keys = [
+        "enable_sleep_mode",
+    ]
+    if is_dict_like:
+        shared_overrides = {k: source[k] for k in shared_keys if k in source and source[k] is not None}
+    else:
+        shared_overrides = {
+            k: getattr(source, k) for k in shared_keys if hasattr(source, k) and getattr(source, k) is not None
+        }
+
+    if shared_overrides:
+        base_engine_args = base_engine_args or {}
+        base_engine_args.update(shared_overrides)
 
     return base_engine_args
 

@@ -24,6 +24,7 @@ def test_default_stage_config_includes_cache_backend(monkeypatch):
         cache_config='{"Fn_compute_blocks": 2}',
         vae_use_slicing=True,
         ulysses_degree=2,
+        enable_sleep_mode=True,
     )
 
     stage_cfg = omni.stage_configs[0]
@@ -33,6 +34,7 @@ def test_default_stage_config_includes_cache_backend(monkeypatch):
     cache_config = engine_args.get("cache_config")
     assert cache_config["Fn_compute_blocks"] == 2
     assert engine_args.get("vae_use_slicing") is True
+    assert engine_args.get("enable_sleep_mode") is True
     parallel_config = engine_args.get("parallel_config")
     if hasattr(parallel_config, "get"):
         ulysses_degree = parallel_config.get("ulysses_degree")
@@ -79,3 +81,9 @@ def test_default_stage_devices_from_sequence_parallel(monkeypatch):
     else:
         devices = getattr(runtime, "devices", None)
     assert devices == "0,1,2,3"
+
+
+def test_build_base_engine_args_includes_enable_sleep_mode():
+    """Ensure global sleep flag is propagated into base engine args."""
+    base_args = utils_module.build_base_engine_args({"enable_sleep_mode": True})
+    assert base_args == {"enable_sleep_mode": True}
