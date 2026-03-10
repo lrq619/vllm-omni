@@ -71,6 +71,7 @@ class DiffusionExecutor(ABC):
         args: tuple = (),
         kwargs: dict | None = None,
         unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any:
         """Execute a method on workers."""
         pass

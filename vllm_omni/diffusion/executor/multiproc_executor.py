@@ -143,6 +143,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         args: tuple = (),
         kwargs: dict | None = None,
         unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any:
         if self._closed:
             raise RuntimeError("DiffusionExecutor is closed.")
@@ -157,6 +158,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "args": args,
             "kwargs": kwargs,
             "output_rank": unique_reply_rank,
+            "exec_all_ranks": exec_all_ranks,
         }
 
         try:

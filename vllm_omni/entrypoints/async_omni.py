@@ -86,6 +86,12 @@ class AsyncEventResolver:
             "expected_count": expected_count,
             "current_count": 0
         }
+        logger.info(
+            "[AsyncEventResolver] Watching task_id=%s expected_count=%d pending=%d",
+            task_id,
+            expected_count,
+            len(self._pending_tasks),
+        )
         return fut
     async def resolve(self, ack: OmniACK):
         # ACK for dictionary type
@@ -99,6 +105,13 @@ class AsyncEventResolver:
         if "received" not in task_info:
             task_info["received"] = []
         task_info["received"].append(ack)
+        logger.info(
+            "[AsyncEventResolver] Resolved task_id=%s received=%d expected=%d ack_type=%s",
+            tid,
+            len(task_info["received"]),
+            task_info["expected_count"],
+            type(ack).__name__,
+        )
 
         # Once an ACK is received, 
         # the data in the video memory is recorded into the indicator database.
@@ -109,6 +122,11 @@ class AsyncEventResolver:
 
         # The Future is only awakened after all Workers' ACKs have been received.
         if len (task_info["received"]) >= task_info["expected_count"]:
+                logger.info(
+                    "[AsyncEventResolver] Completing task_id=%s with %d ACK(s)",
+                    tid,
+                    len(task_info["received"]),
+                )
                 self._pending_tasks.pop(tid)
                 fut = task_info["future"]
                 if not fut.done():
@@ -640,7 +658,10 @@ class AsyncOmni(OmniBase):
                             ack_data = result.get("ack")
                             tid = getattr(ack_data, "task_id", 
                                   ack_data.get("task_id") if isinstance(ack_data, dict) else "unknown")
-                            logger.info(f"[{self._name}] Intercepted wrapped ACK for task {tid} from stage-{stage_id}")
+                            logger.info(
+                                f"[{self._name}] Intercepted wrapped ACK for task {tid} "
+                                f"from stage-{stage_id} type={type(ack_data).__name__}"
+                            )
                             await self.event_resolver.resolve(ack_data)
                             continue
                         if isinstance(result, OmniACK):
@@ -882,7 +903,9 @@ class AsyncOmni(OmniBase):
         total_workers = 0
         for stage_id in stage_ids:
             stage = self.stage_list[stage_id]
-            if stage.engine and stage.engine.executor:
+            if stage.stage_type == "diffusion":
+                total_workers += 1
+            elif stage.engine and stage.engine.executor:
                 total_workers += stage.engine.executor.get_worker_count()
             else:
                 total_workers += 1
@@ -911,7 +934,9 @@ class AsyncOmni(OmniBase):
         total_workers = 0
         for stage_id in stage_ids:
             stage = self.stage_list[stage_id]
-            if stage.engine and stage.engine.executor:
+            if stage.stage_type == "diffusion":
+                total_workers += 1
+            elif stage.engine and stage.engine.executor:
                 total_workers += stage.engine.executor.get_worker_count()
             else:
                 total_workers += 1

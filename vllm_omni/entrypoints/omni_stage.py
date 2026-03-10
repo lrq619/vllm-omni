@@ -1388,10 +1388,20 @@ async def _stage_worker_async(
                 from vllm_omni.diffusion.data import OmniSleepTask
                 async def _run_sleep_and_forward(t: OmniSleepTask):
                     acks = await stage_engine.handle_sleep_task(t)
-                    if acks and isinstance(acks, list):
-                        for ack in acks:
-                            out_q.put({"type": "ack", "ack": ack})
-                    logger.info(f"[Stage-{stage_id}] Sleep ACKs forwarded to Orchestrator")
+                    normalized_acks = acks if isinstance(acks, list) else ([acks] if acks is not None else [])
+                    logger.info(
+                        f"[Stage-{stage_id}] Sleep returned type={type(acks).__name__}, "
+                        f"normalized_count={len(normalized_acks)}"
+                    )
+                    for ack in normalized_acks:
+                        ack_tid = getattr(ack, "task_id", None)
+                        ack_rank = getattr(ack, "rank", None)
+                        logger.info(
+                            f"[Stage-{stage_id}] Forwarding sleep ACK task_id={ack_tid} rank={ack_rank} "
+                            "to Orchestrator"
+                        )
+                        out_q.put({"type": "ack", "ack": ack})
+                    logger.info(f"[Stage-{stage_id}] Sleep ACK forwarding complete")
                 from vllm_omni.diffusion.data import OmniSleepTask
                 asyncio.create_task(_run_sleep_and_forward(OmniSleepTask(
                     task_id=task.get("task_id", "local"),
@@ -1401,9 +1411,20 @@ async def _stage_worker_async(
                 from vllm_omni.diffusion.data import OmniWakeTask
                 async def _run_wake_and_forward(t: OmniWakeTask):
                     acks = await stage_engine.handle_wake_up_task(t)
-                    if acks and isinstance(acks, list):
-                        for ack in acks:
-                            out_q.put({"type": "ack", "ack": ack})
+                    normalized_acks = acks if isinstance(acks, list) else ([acks] if acks is not None else [])
+                    logger.info(
+                        f"[Stage-{stage_id}] Wake-up returned type={type(acks).__name__}, "
+                        f"normalized_count={len(normalized_acks)}"
+                    )
+                    for ack in normalized_acks:
+                        ack_tid = getattr(ack, "task_id", None)
+                        ack_rank = getattr(ack, "rank", None)
+                        logger.info(
+                            f"[Stage-{stage_id}] Forwarding wake-up ACK task_id={ack_tid} rank={ack_rank} "
+                            "to Orchestrator"
+                        )
+                        out_q.put({"type": "ack", "ack": ack})
+                    logger.info(f"[Stage-{stage_id}] Wake-up ACK forwarding complete")
                 from vllm_omni.diffusion.data import OmniWakeTask
                 asyncio.create_task(_run_wake_and_forward(OmniWakeTask(
                     task_id=task.get("task_id", "local"),

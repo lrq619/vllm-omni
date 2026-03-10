@@ -369,6 +369,7 @@ class DiffusionEngine:
         args: tuple = (),
         kwargs: dict | None = None,
         unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any:
         """Call a method on worker processes and get results immediately.
 
@@ -389,6 +390,7 @@ class DiffusionEngine:
             args=args,
             kwargs=kwargs,
             unique_reply_rank=unique_reply_rank,
+            exec_all_ranks=exec_all_ranks,
         )
 
     def close(self) -> None:
@@ -417,7 +419,10 @@ class DiffusionEngine:
                 self.collective_rpc, 
                 "handle_sleep_task", 
                 60.0, # Timeout
-                (OmniSleepTask(task_id=task_id, level=level),)
+                (OmniSleepTask(task_id=task_id, level=level),),
+                None,
+                0,
+                True,
             )
         expected = self.executor.get_worker_count() if hasattr(self.executor, "get_worker_count") else 1
         future = resolver.watch_task(task_id, expected_count=expected)
@@ -440,7 +445,10 @@ class DiffusionEngine:
                 self.collective_rpc,
                 "handle_wake_task",
                 120.0, # Timeout
-                (OmniWakeTask(task_id=task_id, tags=tags),)
+                (OmniWakeTask(task_id=task_id, tags=tags),),
+                None,
+                0,
+                True,
             )
         expected = self.executor.get_worker_count() if hasattr(self.executor, "get_worker_count") else 1
         future = resolver.watch_task(task_id, expected_count=expected)
