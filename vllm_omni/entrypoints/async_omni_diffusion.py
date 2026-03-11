@@ -299,6 +299,46 @@ class AsyncOmniDiffusion:
         )
         return all(results) if isinstance(results, list) else results
 
+    async def update_weights_from_ipc(
+        self,
+        peft_config: dict[str, Any] | None = None,
+        base_sync_done: bool = False,
+        use_shm: bool = False,
+    ) -> Any:
+        """Forward update_weights_from_ipc to the diffusion worker extension."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            self.engine.collective_rpc,
+            "update_weights_from_ipc",
+            None,
+            (),
+            {
+                "peft_config": peft_config,
+                "base_sync_done": base_sync_done,
+                "use_shm": use_shm,
+            },
+            0,
+            True,
+        )
+
+    async def handle_update_weights_from_ipc_task(self, task: Any) -> Any:
+        """Handle a stage task that updates worker weights via IPC."""
+        if isinstance(task, dict):
+            peft_config = task.get("peft_config")
+            base_sync_done = task.get("base_sync_done", False)
+            use_shm = task.get("use_shm", False)
+        else:
+            peft_config = getattr(task, "peft_config", None)
+            base_sync_done = getattr(task, "base_sync_done", False)
+            use_shm = getattr(task, "use_shm", False)
+
+        return await self.update_weights_from_ipc(
+            peft_config=peft_config,
+            base_sync_done=base_sync_done,
+            use_shm=use_shm,
+        )
+
     async def handle_sleep_task(self, task: Any) -> Any:
         """
         The sleep command is physically forwarded from the Orchestrator 

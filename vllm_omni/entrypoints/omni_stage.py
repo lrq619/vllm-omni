@@ -617,6 +617,25 @@ class OmniStage:
             "task_id": task_id
         })
 
+    def update_weights_from_ipc(
+        self,
+        peft_config: dict[str, Any] | None = None,
+        base_sync_done: bool = False,
+        use_shm: bool = False,
+        task_id: str = "local",
+    ) -> None:
+        """Submit an update_weights_from_ipc task to the stage worker."""
+        logger.info(f"[Stage-{self.stage_id}] Submitting UPDATE_WEIGHTS_FROM_IPC task")
+        self.submit(
+            {
+                "type": OmniStageTaskType.UPDATE_WEIGHTS_FROM_IPC,
+                "peft_config": peft_config,
+                "base_sync_done": base_sync_done,
+                "use_shm": use_shm,
+                "task_id": task_id,
+            }
+        )
+
     def try_collect(self) -> dict[str, Any] | None:
         """Try to collect a result from the stage worker without blocking.
 
@@ -1430,6 +1449,31 @@ async def _stage_worker_async(
                     task_id=task.get("task_id", "local"),
                     tags=task.get("tags")
                 )))
+            elif task_type == OmniStageTaskType.UPDATE_WEIGHTS_FROM_IPC:
+                async def _run_update_weights_from_ipc_and_forward(t: dict[str, Any]) -> None:
+                    try:
+                        result = await stage_engine.handle_update_weights_from_ipc_task(t)
+                        out_q.put(
+                            {
+                                "type": "rpc_result",
+                                "task_id": t.get("task_id", "local"),
+                                "stage_id": stage_id,
+                                "method": "update_weights_from_ipc",
+                                "result": result,
+                            }
+                        )
+                    except Exception as e:
+                        out_q.put(
+                            {
+                                "type": "rpc_result",
+                                "task_id": t.get("task_id", "local"),
+                                "stage_id": stage_id,
+                                "method": "update_weights_from_ipc",
+                                "error": str(e),
+                            }
+                        )
+
+                asyncio.create_task(_run_update_weights_from_ipc_and_forward(task))
             elif is_profiler_task(task_type):
                 await handle_profiler_task_async(task_type)
             else:

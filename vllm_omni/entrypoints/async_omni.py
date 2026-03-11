@@ -177,6 +177,7 @@ class AsyncOmni(OmniBase):
         #Initialize the deterministic handshake parser
         self.event_resolver = AsyncEventResolver()
         self.event_resolver.orchestrator = self  # type: ignore[assignment]
+        self._pending_stage_rpc_tasks: dict[str, dict[str, Any]] = {}
         self.output_handler: asyncio.Task | None = None
 
         super().__init__(model, **kwargs)
@@ -251,6 +252,7 @@ class AsyncOmni(OmniBase):
                     "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
                     "enforce_eager": kwargs.get("enforce_eager", False),
                     "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
+                    "worker_extension_cls": kwargs.get("worker_extension_cls", None),
                     "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
                 },
                 "final_output": True,
@@ -664,6 +666,9 @@ class AsyncOmni(OmniBase):
                             )
                             await self.event_resolver.resolve(ack_data)
                             continue
+                        if isinstance(result, dict) and result.get("type") == "rpc_result":
+                            await self._resolve_stage_rpc_result(result)
+                            continue
                         if isinstance(result, OmniACK):
                             logger.debug(f"[{self._name}] Received ACK for task {result.task_id} from stage-{stage_id}")
                             await self.event_resolver.resolve(result)
@@ -705,6 +710,58 @@ class AsyncOmni(OmniBase):
                 self.output_handler = None  # Make possible for restart
 
         self.output_handler = asyncio.create_task(output_handler())
+
+    def _watch_stage_rpc_task(self, task_id: str, expected_stage_ids: list[int]) -> asyncio.Future:
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._pending_stage_rpc_tasks[task_id] = {
+            "future": fut,
+            "expected_stage_ids": set(expected_stage_ids),
+            "received_stage_ids": set(),
+            "results": [],
+        }
+        return fut
+
+    async def _resolve_stage_rpc_result(self, result: dict[str, Any]) -> None:
+        task_id = result.get("task_id")
+        if task_id is None:
+            logger.warning("[%s] Received rpc_result without task_id", self._name)
+            return
+
+        task_info = self._pending_stage_rpc_tasks.get(task_id)
+        if task_info is None:
+            logger.warning("[%s] Received rpc_result for unknown task_id %s", self._name, task_id)
+            return
+
+        stage_id = result.get("stage_id")
+        expected_stage_ids = task_info["expected_stage_ids"]
+        if stage_id not in expected_stage_ids:
+            logger.warning(
+                "[%s] Ignoring rpc_result for task_id=%s from unexpected stage_id=%s",
+                self._name,
+                task_id,
+                stage_id,
+            )
+            return
+
+        received_stage_ids = task_info["received_stage_ids"]
+        if stage_id in received_stage_ids:
+            logger.warning(
+                "[%s] Ignoring duplicate rpc_result for task_id=%s stage_id=%s",
+                self._name,
+                task_id,
+                stage_id,
+            )
+            return
+
+        received_stage_ids.add(stage_id)
+        task_info["results"].append(result)
+
+        if received_stage_ids >= expected_stage_ids:
+            self._pending_stage_rpc_tasks.pop(task_id, None)
+            fut = task_info["future"]
+            if not fut.done():
+                fut.set_result(task_info["results"])
 
     @property
     def is_running(self) -> bool:
@@ -952,3 +1009,51 @@ class AsyncOmni(OmniBase):
             self.stage_list[stage_id].update_status("RUNNING")
             
         return acks
+
+    async def update_weights_from_ipc(
+        self,
+        stage_ids: list[int] | None = None,
+        peft_config: dict[str, Any] | None = None,
+        base_sync_done: bool = False,
+        use_shm: bool = False,
+    ) -> list[Any]:
+        """Forward update_weights_from_ipc to diffusion stage workers."""
+        self._run_output_handler()
+
+        if stage_ids is None:
+            target_stage_ids = [
+                stage_id for stage_id, stage in enumerate(self.stage_list) if stage.stage_type == "diffusion"
+            ]
+        else:
+            target_stage_ids = []
+            for stage_id in stage_ids:
+                stage = self.stage_list[stage_id]
+                if stage.stage_type != "diffusion":
+                    raise ValueError(
+                        f"update_weights_from_ipc only supports diffusion stages, got stage_id={stage_id} "
+                        f"type={stage.stage_type}"
+                    )
+                target_stage_ids.append(stage_id)
+
+        if not target_stage_ids:
+            return []
+
+        task_id = str(uuid.uuid4())
+        future = self._watch_stage_rpc_task(task_id, expected_stage_ids=target_stage_ids)
+
+        for stage_id in target_stage_ids:
+            self.stage_list[stage_id].update_weights_from_ipc(
+                peft_config=peft_config,
+                base_sync_done=base_sync_done,
+                use_shm=use_shm,
+                task_id=task_id,
+            )
+
+        results = await asyncio.wait_for(future, timeout=300)
+        for result in results:
+            if result.get("error") is not None:
+                raise RuntimeError(
+                    f"Stage {result.get('stage_id')} update_weights_from_ipc failed: {result['error']}"
+                )
+
+        return [result.get("result") for result in results]
