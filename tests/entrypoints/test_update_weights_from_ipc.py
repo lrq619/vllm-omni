@@ -266,6 +266,61 @@ async def test_async_omni_diffusion_update_weights_uses_single_reply_rpc(monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "call", "expected_args", "engine_result", "expected_result"),
+    [
+        ("remove_lora", lambda diffusion: AsyncOmniDiffusion.remove_lora(diffusion, 7), (7,), True, True),
+        (
+            "add_lora",
+            lambda diffusion: AsyncOmniDiffusion.add_lora(diffusion, lora_request="req", lora_scale=0.5),
+            (),
+            True,
+            True,
+        ),
+        ("list_loras", lambda diffusion: AsyncOmniDiffusion.list_loras(diffusion), (), [3, 1, 3], [1, 3]),
+        ("pin_lora", lambda diffusion: AsyncOmniDiffusion.pin_lora(diffusion, 9), (), True, True),
+    ],
+)
+async def test_async_omni_diffusion_lora_rpcs_use_single_reply_rank0(
+    monkeypatch, method_name, call, expected_args, engine_result, expected_result
+):
+    fake_loop = _FakeLoop()
+    monkeypatch.setattr(asyncio, "get_event_loop", lambda: fake_loop)
+
+    diffusion = AsyncOmniDiffusion.__new__(AsyncOmniDiffusion)
+    diffusion._executor = object()
+    diffusion.engine = _FakeEngine()
+
+    def _collective_rpc(*args):
+        diffusion.engine.calls.append(args)
+        return engine_result
+
+    diffusion.engine.collective_rpc = _collective_rpc
+
+    result = await call(diffusion)
+
+    assert result == expected_result
+    assert len(fake_loop.calls) == 1
+
+    expected_kwargs = {}
+    if method_name == "add_lora":
+        expected_kwargs = {"lora_request": "req", "lora_scale": 0.5}
+    elif method_name == "pin_lora":
+        expected_kwargs = {"adapter_id": 9}
+
+    assert diffusion.engine.calls == [
+        (
+            method_name,
+            None,
+            expected_args,
+            expected_kwargs,
+            0,
+            True,
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_async_omni_diffusion_lora_task_handlers_forward_arguments(monkeypatch):
     diffusion = AsyncOmniDiffusion.__new__(AsyncOmniDiffusion)
 

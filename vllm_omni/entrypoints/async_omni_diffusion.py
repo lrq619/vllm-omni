@@ -240,64 +240,62 @@ class AsyncOmniDiffusion:
     async def remove_lora(self, adapter_id: int) -> bool:
         """Remove a LoRA"""
         loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(
+        result = await loop.run_in_executor(
             self._executor,
             self.engine.collective_rpc,
             "remove_lora",
             None,
             (adapter_id,),
             {},
-            None,
+            0,
+            True,
         )
-        return all(results) if isinstance(results, list) else results
+        return bool(result)
 
     async def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
         """Add a LoRA adapter"""
         loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(
+        result = await loop.run_in_executor(
             self._executor,
             self.engine.collective_rpc,
             "add_lora",
             None,
             (),
             {"lora_request": lora_request, "lora_scale": lora_scale},
-            None,
+            0,
+            True,
         )
-        return all(results) if isinstance(results, list) else results
+        return bool(result)
 
     async def list_loras(self) -> list[int]:
         """List all registered LoRA adapter IDs."""
         loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(
+        result = await loop.run_in_executor(
             self._executor,
             self.engine.collective_rpc,
             "list_loras",
             None,
             (),
             {},
-            None,
+            0,
+            True,
         )
-        # collective_rpc returns list from workers; flatten unique ids
-        if not isinstance(results, list):
-            return results or []
-        merged: set[int] = set()
-        for part in results:
-            merged.update(part or [])
-        return sorted(merged)
+        return sorted(set(result or []))
 
     async def pin_lora(self, lora_id: int) -> bool:
         """Prevent an adapter from being evicted."""
         loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(
+        result = await loop.run_in_executor(
             self._executor,
             self.engine.collective_rpc,
             "pin_lora",
             None,
             (),
             {"adapter_id": lora_id},
-            None,
+            0,
+            True,
         )
-        return all(results) if isinstance(results, list) else results
+        return bool(result)
 
     async def update_weights_from_ipc(
         self,
