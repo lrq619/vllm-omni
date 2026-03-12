@@ -636,6 +636,55 @@ class OmniStage:
             }
         )
 
+    def add_lora(
+        self,
+        lora_request: Any,
+        lora_scale: float = 1.0,
+        task_id: str = "local",
+    ) -> None:
+        """Submit an add_lora task to the stage worker."""
+        logger.info(f"[Stage-{self.stage_id}] Submitting ADD_LORA task")
+        self.submit(
+            {
+                "type": OmniStageTaskType.ADD_LORA,
+                "lora_request": lora_request,
+                "lora_scale": lora_scale,
+                "task_id": task_id,
+            }
+        )
+
+    def remove_lora(self, adapter_id: int, task_id: str = "local") -> None:
+        """Submit a remove_lora task to the stage worker."""
+        logger.info(f"[Stage-{self.stage_id}] Submitting REMOVE_LORA task")
+        self.submit(
+            {
+                "type": OmniStageTaskType.REMOVE_LORA,
+                "adapter_id": adapter_id,
+                "task_id": task_id,
+            }
+        )
+
+    def list_loras(self, task_id: str = "local") -> None:
+        """Submit a list_loras task to the stage worker."""
+        logger.info(f"[Stage-{self.stage_id}] Submitting LIST_LORAS task")
+        self.submit(
+            {
+                "type": OmniStageTaskType.LIST_LORAS,
+                "task_id": task_id,
+            }
+        )
+
+    def pin_lora(self, lora_id: int, task_id: str = "local") -> None:
+        """Submit a pin_lora task to the stage worker."""
+        logger.info(f"[Stage-{self.stage_id}] Submitting PIN_LORA task")
+        self.submit(
+            {
+                "type": OmniStageTaskType.PIN_LORA,
+                "lora_id": lora_id,
+                "task_id": task_id,
+            }
+        )
+
     def try_collect(self) -> dict[str, Any] | None:
         """Try to collect a result from the stage worker without blocking.
 
@@ -1474,6 +1523,106 @@ async def _stage_worker_async(
                         )
 
                 asyncio.create_task(_run_update_weights_from_ipc_and_forward(task))
+            elif task_type == OmniStageTaskType.ADD_LORA:
+                async def _run_add_lora_and_forward(t: dict[str, Any]) -> None:
+                    try:
+                        result = await stage_engine.handle_add_lora_task(t)
+                        out_q.put(
+                            {
+                                "type": "rpc_result",
+                                "task_id": t.get("task_id", "local"),
+                                "stage_id": stage_id,
+                                "method": "add_lora",
+                                "result": result,
+                            }
+                        )
+                    except Exception as e:
+                        out_q.put(
+                            {
+                                "type": "rpc_result",
+                                "task_id": t.get("task_id", "local"),
+                                "stage_id": stage_id,
+                                "method": "add_lora",
+                                "error": str(e),
+                            }
+                        )
+
+                asyncio.create_task(_run_add_lora_and_forward(task))
+            elif task_type == OmniStageTaskType.REMOVE_LORA:
+                async def _run_remove_lora_and_forward(t: dict[str, Any]) -> None:
+                    try:
+                        result = await stage_engine.handle_remove_lora_task(t)
+                        out_q.put(
+                            {
+                                "type": "rpc_result",
+                                "task_id": t.get("task_id", "local"),
+                                "stage_id": stage_id,
+                                "method": "remove_lora",
+                                "result": result,
+                            }
+                        )
+                    except Exception as e:
+                        out_q.put(
+                            {
+                                "type": "rpc_result",
+                                "task_id": t.get("task_id", "local"),
+                                "stage_id": stage_id,
+                                "method": "remove_lora",
+                                "error": str(e),
+                            }
+                        )
+
+                asyncio.create_task(_run_remove_lora_and_forward(task))
+            elif task_type == OmniStageTaskType.LIST_LORAS:
+                async def _run_list_loras_and_forward(t: dict[str, Any]) -> None:
+                    try:
+                        result = await stage_engine.handle_list_loras_task(t)
+                        out_q.put(
+                            {
+                                "type": "rpc_result",
+                                "task_id": t.get("task_id", "local"),
+                                "stage_id": stage_id,
+                                "method": "list_loras",
+                                "result": result,
+                            }
+                        )
+                    except Exception as e:
+                        out_q.put(
+                            {
+                                "type": "rpc_result",
+                                "task_id": t.get("task_id", "local"),
+                                "stage_id": stage_id,
+                                "method": "list_loras",
+                                "error": str(e),
+                            }
+                        )
+
+                asyncio.create_task(_run_list_loras_and_forward(task))
+            elif task_type == OmniStageTaskType.PIN_LORA:
+                async def _run_pin_lora_and_forward(t: dict[str, Any]) -> None:
+                    try:
+                        result = await stage_engine.handle_pin_lora_task(t)
+                        out_q.put(
+                            {
+                                "type": "rpc_result",
+                                "task_id": t.get("task_id", "local"),
+                                "stage_id": stage_id,
+                                "method": "pin_lora",
+                                "result": result,
+                            }
+                        )
+                    except Exception as e:
+                        out_q.put(
+                            {
+                                "type": "rpc_result",
+                                "task_id": t.get("task_id", "local"),
+                                "stage_id": stage_id,
+                                "method": "pin_lora",
+                                "error": str(e),
+                            }
+                        )
+
+                asyncio.create_task(_run_pin_lora_and_forward(task))
             elif is_profiler_task(task_type):
                 await handle_profiler_task_async(task_type)
             else:

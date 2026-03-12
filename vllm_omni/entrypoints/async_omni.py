@@ -856,9 +856,96 @@ class AsyncOmni(OmniBase):
         """Check whether the engine is sleeping"""
         return False
 
-    async def add_lora(self, lora_request: LoRARequest) -> bool:
-        """Load a new LoRA adapter into the engine for future requests."""
-        return False
+    def _resolve_target_diffusion_stage_ids(
+        self,
+        stage_ids: list[int] | None,
+        method_name: str,
+    ) -> list[int]:
+        if stage_ids is None:
+            return [stage_id for stage_id, stage in enumerate(self.stage_list) if stage.stage_type == "diffusion"]
+
+        target_stage_ids = []
+        for stage_id in stage_ids:
+            stage = self.stage_list[stage_id]
+            if stage.stage_type != "diffusion":
+                raise ValueError(
+                    f"{method_name} only supports diffusion stages, got stage_id={stage_id} "
+                    f"type={stage.stage_type}"
+                )
+            target_stage_ids.append(stage_id)
+        return target_stage_ids
+
+    async def _run_diffusion_stage_rpc(
+        self,
+        method_name: str,
+        submitter: Any,
+        stage_ids: list[int] | None = None,
+        timeout: float = 300,
+    ) -> list[Any]:
+        self._run_output_handler()
+        target_stage_ids = self._resolve_target_diffusion_stage_ids(stage_ids, method_name)
+        if not target_stage_ids:
+            return []
+
+        task_id = str(uuid.uuid4())
+        future = self._watch_stage_rpc_task(task_id, expected_stage_ids=target_stage_ids)
+
+        for stage_id in target_stage_ids:
+            submitter(self.stage_list[stage_id], task_id)
+
+        results = await asyncio.wait_for(future, timeout=timeout)
+        for result in results:
+            if result.get("error") is not None:
+                raise RuntimeError(f"Stage {result.get('stage_id')} {method_name} failed: {result['error']}")
+        return results
+
+    async def add_lora(
+        self,
+        lora_request: LoRARequest,
+        stage_ids: list[int] | None = None,
+        lora_scale: float = 1.0,
+    ) -> bool:
+        """Load a new LoRA adapter into target diffusion stages."""
+        results = await self._run_diffusion_stage_rpc(
+            "add_lora",
+            lambda stage, task_id: stage.add_lora(
+                lora_request=lora_request,
+                lora_scale=lora_scale,
+                task_id=task_id,
+            ),
+            stage_ids=stage_ids,
+        )
+        return all(result.get("result") for result in results)
+
+    async def remove_lora(self, adapter_id: int, stage_ids: list[int] | None = None) -> bool:
+        """Remove a LoRA adapter from target diffusion stages."""
+        results = await self._run_diffusion_stage_rpc(
+            "remove_lora",
+            lambda stage, task_id: stage.remove_lora(adapter_id=adapter_id, task_id=task_id),
+            stage_ids=stage_ids,
+        )
+        return all(result.get("result") for result in results)
+
+    async def list_loras(self, stage_ids: list[int] | None = None) -> list[int]:
+        """List loaded LoRA adapter IDs from target diffusion stages."""
+        results = await self._run_diffusion_stage_rpc(
+            "list_loras",
+            lambda stage, task_id: stage.list_loras(task_id=task_id),
+            stage_ids=stage_ids,
+        )
+        merged: set[int] = set()
+        for result in results:
+            merged.update(result.get("result") or [])
+        return sorted(merged)
+
+    async def pin_lora(self, lora_id: int, stage_ids: list[int] | None = None) -> bool:
+        """Pin a LoRA adapter in target diffusion stages."""
+        results = await self._run_diffusion_stage_rpc(
+            "pin_lora",
+            lambda stage, task_id: stage.pin_lora(lora_id=lora_id, task_id=task_id),
+            stage_ids=stage_ids,
+        )
+        return all(result.get("result") for result in results)
 
     async def encode(
         self,
@@ -1018,42 +1105,14 @@ class AsyncOmni(OmniBase):
         use_shm: bool = False,
     ) -> list[Any]:
         """Forward update_weights_from_ipc to diffusion stage workers."""
-        self._run_output_handler()
-
-        if stage_ids is None:
-            target_stage_ids = [
-                stage_id for stage_id, stage in enumerate(self.stage_list) if stage.stage_type == "diffusion"
-            ]
-        else:
-            target_stage_ids = []
-            for stage_id in stage_ids:
-                stage = self.stage_list[stage_id]
-                if stage.stage_type != "diffusion":
-                    raise ValueError(
-                        f"update_weights_from_ipc only supports diffusion stages, got stage_id={stage_id} "
-                        f"type={stage.stage_type}"
-                    )
-                target_stage_ids.append(stage_id)
-
-        if not target_stage_ids:
-            return []
-
-        task_id = str(uuid.uuid4())
-        future = self._watch_stage_rpc_task(task_id, expected_stage_ids=target_stage_ids)
-
-        for stage_id in target_stage_ids:
-            self.stage_list[stage_id].update_weights_from_ipc(
+        results = await self._run_diffusion_stage_rpc(
+            "update_weights_from_ipc",
+            lambda stage, task_id: stage.update_weights_from_ipc(
                 peft_config=peft_config,
                 base_sync_done=base_sync_done,
                 use_shm=use_shm,
                 task_id=task_id,
-            )
-
-        results = await asyncio.wait_for(future, timeout=300)
-        for result in results:
-            if result.get("error") is not None:
-                raise RuntimeError(
-                    f"Stage {result.get('stage_id')} update_weights_from_ipc failed: {result['error']}"
-                )
-
+            ),
+            stage_ids=stage_ids,
+        )
         return [result.get("result") for result in results]

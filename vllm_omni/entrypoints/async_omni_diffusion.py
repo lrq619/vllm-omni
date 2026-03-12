@@ -339,6 +339,30 @@ class AsyncOmniDiffusion:
             use_shm=use_shm,
         )
 
+    async def handle_add_lora_task(self, task: Any) -> bool:
+        """Handle a stage task that loads a LoRA adapter."""
+        if isinstance(task, dict):
+            lora_request = task.get("lora_request")
+            lora_scale = task.get("lora_scale", 1.0)
+        else:
+            lora_request = getattr(task, "lora_request", None)
+            lora_scale = getattr(task, "lora_scale", 1.0)
+        return await self.add_lora(lora_request=lora_request, lora_scale=lora_scale)
+
+    async def handle_remove_lora_task(self, task: Any) -> bool:
+        """Handle a stage task that unloads a LoRA adapter."""
+        adapter_id = task.get("adapter_id") if isinstance(task, dict) else getattr(task, "adapter_id")
+        return await self.remove_lora(adapter_id=adapter_id)
+
+    async def handle_list_loras_task(self, task: Any) -> list[int]:
+        """Handle a stage task that lists loaded LoRA adapters."""
+        return await self.list_loras()
+
+    async def handle_pin_lora_task(self, task: Any) -> bool:
+        """Handle a stage task that pins a LoRA adapter."""
+        lora_id = task.get("lora_id") if isinstance(task, dict) else getattr(task, "lora_id")
+        return await self.pin_lora(lora_id=lora_id)
+
     async def handle_sleep_task(self, task: Any) -> Any:
         """
         The sleep command is physically forwarded from the Orchestrator 

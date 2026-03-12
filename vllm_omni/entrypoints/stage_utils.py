@@ -21,6 +21,10 @@ class OmniStageTaskType(enum.Enum):
     SLEEP = "sleep"
     WAKE_UP = "wake_up"
     UPDATE_WEIGHTS_FROM_IPC = "update_weights_from_ipc"
+    ADD_LORA = "add_lora"
+    REMOVE_LORA = "remove_lora"
+    LIST_LORAS = "list_loras"
+    PIN_LORA = "pin_lora"
 
 
 SHUTDOWN_TASK = {"type": OmniStageTaskType.SHUTDOWN}
