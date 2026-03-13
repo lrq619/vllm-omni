@@ -418,7 +418,7 @@ class DiffusionEngine:
                 None, 
                 self.collective_rpc, 
                 "handle_sleep_task", 
-                60.0, # Timeout
+                300.0, # Timeout
                 (OmniSleepTask(task_id=task_id, level=level),),
                 None,
                 0,
@@ -431,7 +431,7 @@ class DiffusionEngine:
             args=(OmniSleepTask(task_id=task_id, level=level),)
         )
         logger.info(f"[Diffusion Engine] Sleep Task {task_id} dispatched. Awaiting {expected} ACKs...")
-        return await asyncio.wait_for(future, timeout=60.0)
+        return await asyncio.wait_for(future, timeout=300.0)
 
     async def wake_up(self, tags: list[str] | None = None, task_id: str | None = None) -> list[OmniACK]:
         """Deterministic wake-up interface"""
