@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import logging
 from typing import Any, Literal
 
 import torch
@@ -21,7 +22,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.qwen_image import QwenImagePipeline
-from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
+from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer_step import (
     QwenImageTransformer2DModelStep,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -31,6 +32,9 @@ from vllm_omni.diffusion.models.qwen_image.scheduling_flow_match_sde_discrete im
 # from roll.third_party.vllm_omni.pipeline.tensor_recorder import TensorRecorder
 
 
+
+
+logger = logging.getLogger(__name__)
 
 
 def _maybe_to_cpu(v):
@@ -166,72 +170,65 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
         generator,
         logprobs,
     ):
+        if sde_window[0] < 0 or sde_window[1] < sde_window[0]:
+            raise ValueError(
+                f"Invalid `sde_window`: expected (start>=0, end>=start), got {sde_window}."
+            )
+        if sde_window[1] >= len(timesteps):
+            raise ValueError(
+                f"Invalid `sde_window`: end index {sde_window[1]} is out of range for "
+                f"{len(timesteps)} timesteps."
+            )
+        if do_true_cfg and (
+            negative_prompt_embeds is None
+            or negative_prompt_embeds_mask is None
+            or negative_txt_seq_lens is None
+        ):
+            raise ValueError(
+                "CFG is enabled (`do_true_cfg=True`) but negative prompt tensors are missing. "
+                "Required: `negative_prompt_embeds`, `negative_prompt_embeds_mask`, "
+                "`negative_txt_seq_lens`."
+            )
 
+        logger.info(
+            "Starting diffuse loop: num_steps=%d, sde_window=%s, noise_level=%.4f, sde_type=%s, logprobs=%s",
+            len(timesteps),
+            sde_window,
+            float(noise_level),
+            sde_type,
+            logprobs,
+        )
         all_latents = []
         all_log_probs = []
         all_timesteps = []
         self.scheduler.set_begin_index(0)
         for i, t in enumerate(timesteps):
-            prefix = f"diffuse.step.{i}"
             if self.interrupt:
+                logger.warning("Diffuse interrupted at step=%d.", i)
                 continue
 
-            if i < sde_window[0]:
-                cur_noise_level = 0.0
-            elif i == sde_window[0]:
-                cur_noise_level = noise_level
-                all_latents.append(latents)
-            elif i > sde_window[0] and i < sde_window[1]:
-                cur_noise_level = noise_level
-            else:
-                cur_noise_level = 0.0
-
-            self._current_timestep = t
-
-            # Broadcast timestep to match batch size
-            timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
-
-            # Forward pass for positive prompt (or unconditional if no CFG)
-            self.transformer.do_true_cfg = do_true_cfg
-            noise_pred = self.transformer(
-                hidden_states=latents,
-                timestep=timestep / 1000,
-                guidance=guidance,
-                encoder_hidden_states_mask=prompt_embeds_mask,
-                encoder_hidden_states=prompt_embeds,
+            step_output = self.denoise_step(
+                step_index=i,
+                t=t,
+                latents=latents,
+                prompt_embeds=prompt_embeds,
+                prompt_embeds_mask=prompt_embeds_mask,
+                negative_prompt_embeds=negative_prompt_embeds,
+                negative_prompt_embeds_mask=negative_prompt_embeds_mask,
                 img_shapes=img_shapes,
                 txt_seq_lens=txt_seq_lens,
-                attention_kwargs=self.attention_kwargs,
-                return_dict=False,
-            )[0]
-            # Forward pass for negative prompt (CFG)
-            if do_true_cfg:
-                neg_noise_pred = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    encoder_hidden_states_mask=negative_prompt_embeds_mask,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    img_shapes=img_shapes,
-                    txt_seq_lens=negative_txt_seq_lens,
-                    attention_kwargs=self.attention_kwargs,
-                    return_dict=False,
-                )[0]
-                comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
-                cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-                noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-                noise_pred = comb_pred * (cond_norm / noise_norm)
-            # compute the previous noisy sample x_t -> x_t-1
-            latents, log_prob, prev_sample_mean, std_dev_t = self.scheduler.step(
-                noise_pred,
-                t,
-                latents,
-                generator=generator,
-                noise_level=cur_noise_level,
+                negative_txt_seq_lens=negative_txt_seq_lens,
+                do_true_cfg=do_true_cfg,
+                guidance=guidance,
+                true_cfg_scale=true_cfg_scale,
+                noise_level=noise_level,
+                sde_window=sde_window,
                 sde_type=sde_type,
+                generator=generator,
                 logprobs=logprobs,
-                return_dict=False,
             )
+            latents = step_output["latents"]
+            log_prob = step_output["log_prob"]
 
             if i >= sde_window[0] and i < sde_window[1]:
                 all_latents.append(latents)
@@ -252,6 +249,97 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
         all_timesteps = torch.stack(all_timesteps).unsqueeze(0).expand(latents.shape[0], -1)
 
         return latents, all_latents, all_log_probs, all_timesteps
+
+    def denoise_step(
+        self,
+        *,
+        step_index: int,
+        t: torch.Tensor,
+        latents: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        prompt_embeds_mask: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None,
+        negative_prompt_embeds_mask: torch.Tensor | None,
+        img_shapes,
+        txt_seq_lens,
+        negative_txt_seq_lens,
+        do_true_cfg: bool,
+        guidance: torch.Tensor | None,
+        true_cfg_scale: float,
+        noise_level: float,
+        sde_window: tuple[int, int],
+        sde_type: Literal["sde", "cps"],
+        generator: torch.Generator | list[torch.Generator] | None,
+        logprobs: bool,
+    ) -> dict[str, torch.Tensor | None]:
+        if step_index < sde_window[0]:
+            cur_noise_level = 0.0
+        elif step_index < sde_window[1]:
+            cur_noise_level = noise_level
+        else:
+            cur_noise_level = 0.0
+
+        self._current_timestep = t
+        timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
+        self.transformer.do_true_cfg = do_true_cfg
+
+        noise_pred = self.transformer(
+            hidden_states=latents,
+            timestep=timestep / 1000,
+            guidance=guidance,
+            encoder_hidden_states_mask=prompt_embeds_mask,
+            encoder_hidden_states=prompt_embeds,
+            img_shapes=img_shapes,
+            txt_seq_lens=txt_seq_lens,
+            attention_kwargs=self.attention_kwargs,
+            return_dict=False,
+        )[0]
+
+        if do_true_cfg:
+            if (
+                negative_prompt_embeds is None
+                or negative_prompt_embeds_mask is None
+                or negative_txt_seq_lens is None
+            ):
+                raise ValueError(
+                    f"Step {step_index}: missing negative prompt tensors while CFG is enabled."
+                )
+            neg_noise_pred = self.transformer(
+                hidden_states=latents,
+                timestep=timestep / 1000,
+                guidance=guidance,
+                encoder_hidden_states_mask=negative_prompt_embeds_mask,
+                encoder_hidden_states=negative_prompt_embeds,
+                img_shapes=img_shapes,
+                txt_seq_lens=negative_txt_seq_lens,
+                attention_kwargs=self.attention_kwargs,
+                return_dict=False,
+            )[0]
+            comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+            cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+            noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
+            noise_pred = comb_pred * (cond_norm / noise_norm)
+
+        next_latents, log_prob, _, _ = self.scheduler.step(
+            noise_pred,
+            t,
+            latents,
+            generator=generator,
+            noise_level=cur_noise_level,
+            sde_type=sde_type,
+            logprobs=logprobs,
+            return_dict=False,
+        )
+
+        logger.debug(
+            "denoise_step=%d done: t=%s, noise_level=%.4f, do_true_cfg=%s",
+            step_index,
+            str(t.item() if t.numel() == 1 else t.shape),
+            float(cur_noise_level),
+            do_true_cfg,
+        )
+
+        return {"latents": next_latents, "log_prob": log_prob}
 
     def forward(
         self,
