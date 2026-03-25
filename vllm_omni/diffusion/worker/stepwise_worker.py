@@ -338,9 +338,9 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             req_scheduler.set_begin_index(0)
 
             if pipeline.transformer.guidance_embeds:
-                guidance = torch.full([1], float(sp.guidance_scale), dtype=torch.float32, device=pipeline.device)
+                guidance = torch.full((1, 1), float(sp.guidance_scale), dtype=torch.float32, device=pipeline.device)
             else:
-                guidance = torch.zeros((1,), dtype=torch.float32, device=pipeline.device)
+                guidance = torch.zeros((1, 1), dtype=torch.float32, device=pipeline.device)
 
             if sde_window_size is not None:
                 if not isinstance(sde_window_range, (tuple, list)) or len(sde_window_range) != 2:
@@ -451,7 +451,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
         prompt_embeds_mask = manager.get("prompt_embeds_mask", row_indices)
         negative_prompt_embeds = manager.get("negative_prompt_embeds", row_indices)
         negative_prompt_embeds_mask = manager.get("negative_prompt_embeds_mask", row_indices)
-        guidance = manager.get("guidance", row_indices)
+        guidance = manager.get("guidance", row_indices).squeeze(-1)
 
         timesteps = torch.tensor(plan.timesteps, dtype=latents.dtype, device=latents.device)
         img_shapes = [self._states[r].img_shapes for r in plan.request_ids]
