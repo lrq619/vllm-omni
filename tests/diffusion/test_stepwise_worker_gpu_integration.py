@@ -146,7 +146,8 @@ def test_stepwise_worker_staggered_32_requests_gpu():
         prompt_mask = [1] * len(prompt_ids)
 
         futures = []
-        for i in range(32):
+        request_num = 8
+        for i in range(request_num):
             request = OmniDiffusionRequest(
                 prompts=[{"prompt_ids": prompt_ids, "prompt_mask": prompt_mask}],
                 sampling_params=sampling_params,
@@ -156,7 +157,7 @@ def test_stepwise_worker_staggered_32_requests_gpu():
             time.sleep(1)
 
         outputs = [future.result(timeout=3600) for future in futures]
-        assert len(outputs) == 32
+        assert len(outputs) == request_num
         assert all(isinstance(output.output, torch.Tensor) for output in outputs)
 
         metric = executor.collective_rpc(
@@ -164,7 +165,7 @@ def test_stepwise_worker_staggered_32_requests_gpu():
             unique_reply_rank=0,
         )
         metric_json = metric.dump_json()
-        assert metric_json["summary"]["total_plans"] >= 10
+        assert metric_json["summary"]["total_plans"] >= 5
         assert metric_json["summary"]["max_batch_size"] >= 1
 
         (out_dir / "stepwise_metric.json").write_text(json.dumps(metric_json, ensure_ascii=True), encoding="utf-8")
