@@ -11,9 +11,8 @@ import pytest
 import torch
 from PIL import Image
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion]
@@ -59,7 +58,7 @@ def test_stepwise_worker_metric_and_output_dump_gpu():
     out_dir = Path("output/stepwise_worker_gpu_integration")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    od_config = OmniDiffusionConfig(
+    omni = OmniDiffusion(
         model=model,
         enable_stepwise=True,
         num_gpus=1,
@@ -68,9 +67,8 @@ def test_stepwise_worker_metric_and_output_dump_gpu():
             "pipeline_class": "vllm_omni.diffusion.models.qwen_image.pipeline_qwenimage_step."
             "QwenImagePipelineWithLogProbStep"
         },
-        model_class_name="QwenImagePipelineWithLogProbStep",
     )
-    executor = MultiprocDiffusionExecutor(od_config)
+    executor = omni.engine.executor
     try:
         # Keep resolution moderate so JSON dump stays practical.
         sampling_params = OmniDiffusionSamplingParams(
@@ -115,4 +113,4 @@ def test_stepwise_worker_metric_and_output_dump_gpu():
         (out_dir / "stepwise_metric.json").write_text(json.dumps(metric_json, ensure_ascii=True), encoding="utf-8")
         (out_dir / "stepwise_metric.txt").write_text(metric.dump_str(), encoding="utf-8")
     finally:
-        executor.shutdown()
+        omni.close()
