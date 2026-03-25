@@ -66,7 +66,8 @@ class WorkerRequestState:
 
 @dataclass
 class StepwisePlanMetric:
-    timestamp_ms: float
+    metric_id: int
+    loop_end_timestamp_ms: float
     plan_id: str
     batch_size: int
     request_ids: list[str]
@@ -88,6 +89,8 @@ class StepwiseWorkerMetric:
     def record_plan(
         self,
         *,
+        metric_id: int,
+        loop_end_timestamp_ms: float,
         plan_id: str,
         request_ids: list[str],
         row_indices: list[int],
@@ -98,7 +101,8 @@ class StepwiseWorkerMetric:
         cuda_reserved_mb: float,
     ) -> dict[str, Any]:
         metric = StepwisePlanMetric(
-            timestamp_ms=time.time() * 1000.0,
+            metric_id=int(metric_id),
+            loop_end_timestamp_ms=float(loop_end_timestamp_ms),
             plan_id=plan_id,
             batch_size=len(request_ids),
             request_ids=list(request_ids),
@@ -187,6 +191,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
         self._max_bsz: int | None = None
         self._pool_specs: dict[str, tuple[tuple[int, ...], torch.dtype, torch.device]] = {}
         self._metrics = StepwiseWorkerMetric()
+        self._non_empty_loop_counter: int = 0
 
     def _pipeline(self) -> QwenImagePipelineWithLogProbStep:
         assert self.model_runner is not None, "Model runner not initialized"
@@ -209,6 +214,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
         self._states.clear()
         self._pool_specs.clear()
         self._metrics.reset()
+        self._non_empty_loop_counter = 0
         self._max_bsz = max_bsz
         logger.info("StepwiseWorker runtime initialized with max_bsz=%d", max_bsz)
         return {"max_bsz": max_bsz}
@@ -475,6 +481,8 @@ class DiffusionStepwiseWorker(DiffusionWorker):
         if len(plan.request_ids) != len(plan.row_indices):
             logger.error("Plan shape mismatch request_ids=%d row_indices=%d", len(plan.request_ids), len(plan.row_indices))
             raise RuntimeError("Plan shape mismatch: request_ids vs row_indices")
+        self._non_empty_loop_counter += 1
+        metric_id = self._non_empty_loop_counter
 
         for req_id, row_idx in zip(plan.request_ids, plan.row_indices, strict=True):
             if req_id not in self._states:
@@ -504,6 +512,10 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 guidance = manager.get("guidance", row_indices).squeeze(-1)
 
             timesteps = torch.tensor(plan.timesteps, dtype=latents.dtype, device=latents.device)
+            if timesteps.ndim != 1 or timesteps.shape[0] != len(plan.request_ids):
+                raise RuntimeError(
+                    f"Invalid plan.timesteps shape={tuple(timesteps.shape)} for batch={len(plan.request_ids)}."
+                )
             img_shapes = [self._states[r].img_shapes for r in plan.request_ids]
             txt_seq_lens = [self._states[r].txt_seq_len for r in plan.request_ids]
 
@@ -620,7 +632,10 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             manager.put("latents", row_indices, torch.cat(next_latents, dim=0))
             latency_ms = (time.perf_counter() - start_time) * 1000.0
             cuda_allocated_mb, cuda_reserved_mb = _cuda_mem_mb(latents.device)
+            loop_end_timestamp_ms = time.time() * 1000.0
             step_metric = self._metrics.record_plan(
+                metric_id=metric_id,
+                loop_end_timestamp_ms=loop_end_timestamp_ms,
                 plan_id=plan.plan_id,
                 request_ids=plan.request_ids,
                 row_indices=row_indices,

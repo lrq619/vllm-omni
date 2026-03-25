@@ -134,7 +134,7 @@ def test_stepwise_worker_staggered_32_requests_gpu():
     executor = omni.engine.executor
     try:
         sampling_params = OmniDiffusionSamplingParams(
-            num_inference_steps=10,
+            num_inference_steps=20,
             guidance_scale=1.0,
             true_cfg_scale=1.0,
             width=256,
@@ -154,7 +154,7 @@ def test_stepwise_worker_staggered_32_requests_gpu():
                 request_ids=[f"gpu-stepwise-staggered-{i:02d}"],
             )
             futures.append(executor.add_req(request))
-            time.sleep(1)
+            time.sleep(2)
 
         outputs = [future.result(timeout=3600) for future in futures]
         assert len(outputs) == request_num

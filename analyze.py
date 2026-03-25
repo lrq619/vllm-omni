@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze stepwise metric JSON and plot batch size vs. step id."""
+"""Analyze stepwise metric JSON and plot batch size vs. loop-end timestamp."""
 
 from __future__ import annotations
 
@@ -11,31 +11,30 @@ from typing import Iterable
 import matplotlib.pyplot as plt
 
 
-def iter_points(plans: Iterable[dict]) -> Iterable[tuple[int, int]]:
-    """Yield (step_id, batch_size) pairs from the metric plans."""
+def iter_points(plans: Iterable[dict]) -> Iterable[tuple[float, int]]:
+    """Yield (timestamp_s, batch_size) pairs from the metric plans."""
     for plan in plans:
         batch_size = plan.get("batch_size")
-        step_indices = plan.get("step_indices") or []
-        if batch_size is None:
+        ts_ms = plan.get("loop_end_timestamp_ms", plan.get("timestamp_ms"))
+        if batch_size is None or ts_ms is None:
             continue
-        for step_id in step_indices:
-            yield int(step_id), int(batch_size)
+        yield float(ts_ms) / 1000.0, int(batch_size)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Plot batch size vs. step id from stepwise_metric.json."
+        description="Plot batch size vs. loop-end timestamp (s) from stepwise_metric.json."
     )
     parser.add_argument(
         "--input",
         type=Path,
-        default=Path("output/stepwise_worker_gpu_integration/stepwise_metric.json"),
+        default=Path("output/stepwise_worker_gpu_integration/32_requests/stepwise_metric.json"),
         help="Path to the input JSON file.",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("output/stepwise_batch_size_vs_step_id.png"),
+        default=Path("output/stepwise_batch_size_vs_timestamp_s.png"),
         help="Path to save the output plot.",
     )
     args = parser.parse_args()
@@ -45,18 +44,18 @@ def main() -> None:
 
     points = sorted(iter_points(metric.get("plans", [])), key=lambda item: item[0])
     if not points:
-        raise SystemExit(f"No step/batch points found in {args.input}")
+        raise SystemExit(f"No timestamp/batch points found in {args.input}")
 
-    steps = [step for step, _ in points]
+    timestamps_s = [timestamp_s for timestamp_s, _ in points]
     batch_sizes = [batch for _, batch in points]
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     plt.figure(figsize=(8, 4.5))
-    plt.plot(steps, batch_sizes, marker="o", linewidth=1.8)
-    plt.xlabel("Step id")
+    plt.plot(timestamps_s, batch_sizes, marker="o", linewidth=1.8)
+    plt.xlabel("Loop-end timestamp (s)")
     plt.ylabel("Batch size")
-    plt.title("Batch size vs. Step id")
+    plt.title("Batch size vs. Loop-end timestamp (s)")
     plt.grid(True, linestyle="--", alpha=0.35)
     plt.tight_layout()
     plt.savefig(args.output, dpi=200)
