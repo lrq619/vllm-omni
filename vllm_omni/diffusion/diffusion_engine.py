@@ -218,7 +218,10 @@ class DiffusionEngine:
         return DiffusionEngine(config)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest):
-        return self.executor.add_req(request)
+        result = self.executor.add_req(request)
+        if self.od_config.enable_stepwise:
+            return result.result()  # type: ignore[union-attr]
+        return result
 
     def start_profile(self, trace_filename: str | None = None) -> None:
         """
@@ -353,6 +356,7 @@ class DiffusionEngine:
         prompt: OmniTextPrompt = {"prompt": "dummy run", "multi_modal_data": {"image": dummy_image}}
         req = OmniDiffusionRequest(
             prompts=[prompt],
+            request_ids=["dummy-run-0"],
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
