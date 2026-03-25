@@ -278,7 +278,18 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             height = sp.height or pipeline.default_sample_size * pipeline.vae_scale_factor
             width = sp.width or pipeline.default_sample_size * pipeline.vae_scale_factor
             num_inference_steps = int(sp.num_inference_steps)
-            max_sequence_length = int(sp.max_sequence_length or 512)
+            max_sequence_length = int(pipeline.tokenizer_max_length + pipeline.prompt_template_encode_start_idx)
+            if sp.max_sequence_length is not None and int(sp.max_sequence_length) > max_sequence_length:
+                logger.error(
+                    "Requested max_sequence_length=%s exceeds model limit=%d for request_id=%s",
+                    sp.max_sequence_length,
+                    max_sequence_length,
+                    request_id,
+                )
+                raise ValueError(
+                    f"Requested max_sequence_length={sp.max_sequence_length} exceeds model limit={max_sequence_length} "
+                    f"for request_id={request_id}"
+                )
             true_cfg_scale = float(sp.true_cfg_scale or 4.0)
             noise_level = float(sp.extra_args.get("noise_level", 0.7))
             sde_window_size = sp.extra_args.get("sde_window_size", None)
@@ -457,10 +468,11 @@ class DiffusionStepwiseWorker(DiffusionWorker):
 
         row_indices = list(plan.row_indices)
         latents = manager.get("latents", row_indices)
-        prompt_embeds = manager.get("prompt_embeds", row_indices)
-        prompt_embeds_mask = manager.get("prompt_embeds_mask", row_indices)
-        negative_prompt_embeds = manager.get("negative_prompt_embeds", row_indices)
-        negative_prompt_embeds_mask = manager.get("negative_prompt_embeds_mask", row_indices)
+        prompt_embeds, prompt_embeds_mask, prompt_max_seq_len = manager.get_prompt_batch(
+            "prompt_embeds",
+            "prompt_embeds_mask",
+            row_indices,
+        )
         guidance = None
         if pipeline.transformer.guidance_embeds:
             guidance = manager.get("guidance", row_indices).squeeze(-1)
@@ -474,6 +486,12 @@ class DiffusionStepwiseWorker(DiffusionWorker):
         pipeline._current_timestep = None
         pipeline.transformer.do_true_cfg = False
 
+        logger.debug(
+            "Stepwise prompt batch trimmed plan_id=%s request_ids=%s max_seq_len=%d",
+            plan.plan_id,
+            plan.request_ids,
+            prompt_max_seq_len,
+        )
         transformer_kwargs = dict(
             hidden_states=latents,
             timestep=timesteps / 1000,
@@ -495,6 +513,18 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             neg_txt_seq_lens = [self._states[plan.request_ids[i]].negative_txt_seq_len for i in cfg_indices]
             if any(x is None for x in neg_txt_seq_lens):
                 raise RuntimeError("CFG request is missing negative_txt_seq_len.")
+
+            negative_prompt_embeds, negative_prompt_embeds_mask, negative_prompt_max_seq_len = manager.get_prompt_batch(
+                "negative_prompt_embeds",
+                "negative_prompt_embeds_mask",
+                row_indices,
+            )
+            logger.debug(
+                "Stepwise negative prompt batch trimmed plan_id=%s request_ids=%s max_seq_len=%d",
+                plan.plan_id,
+                plan.request_ids,
+                negative_prompt_max_seq_len,
+            )
 
             neg_transformer_kwargs = dict(
                 hidden_states=latents[idx_tensor],

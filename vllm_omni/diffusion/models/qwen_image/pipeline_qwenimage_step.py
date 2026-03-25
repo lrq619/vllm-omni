@@ -83,6 +83,7 @@ class QwenImagePipelineWithLogProbStep(QwenImagePipeline):
         # self.image_processor = VaeImageProcessor(
         #     vae_scale_factor=self.vae_scale_factor * 2
         # )
+        self.tokenizer_max_length = 1024
         self.prompt_template_encode_start_idx = 34
         self.default_sample_size = 128
 

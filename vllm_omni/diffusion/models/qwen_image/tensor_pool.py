@@ -260,6 +260,44 @@ class TensorPoolManager:
         self._ensure_rows_allocated(idx)
         return pool.get(idx)
 
+    def get_prompt_batch(
+        self,
+        prompt_name: str,
+        mask_name: str,
+        indicies: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        prompt_pool = self._get_pool_or_raise(prompt_name)
+        mask_pool = self._get_pool_or_raise(mask_name)
+        idx = self._validate_indicies(indicies)
+        self._ensure_rows_allocated(idx)
+
+        if not idx:
+            prompt_shape = (0, 0, *prompt_pool.shape[1:])
+            mask_shape = (0, 0, *mask_pool.shape[1:])
+            return (
+                torch.empty(prompt_shape, dtype=prompt_pool.dtype, device=prompt_pool.device),
+                torch.empty(mask_shape, dtype=mask_pool.dtype, device=mask_pool.device),
+                0,
+            )
+
+        max_seq_len = 0
+        for row_idx in idx:
+            row_mask = mask_pool.data[row_idx]
+            seq_len = int(row_mask.sum().item())
+            if seq_len > max_seq_len:
+                max_seq_len = seq_len
+
+        prompt_shape = (len(idx), max_seq_len, *prompt_pool.shape[1:])
+        mask_shape = (len(idx), max_seq_len, *mask_pool.shape[1:])
+        prompt_batch = torch.empty(prompt_shape, dtype=prompt_pool.dtype, device=prompt_pool.device)
+        mask_batch = torch.empty(mask_shape, dtype=mask_pool.dtype, device=mask_pool.device)
+
+        for out_idx, row_idx in enumerate(idx):
+            prompt_batch[out_idx] = prompt_pool.data[row_idx, :max_seq_len]
+            mask_batch[out_idx] = mask_pool.data[row_idx, :max_seq_len]
+
+        return prompt_batch, mask_batch, max_seq_len
+
     def put(self, name: str, indicies: list[int], tensor: torch.Tensor) -> None:
         pool = self._get_pool_or_raise(name)
         idx = self._validate_indicies(indicies)
