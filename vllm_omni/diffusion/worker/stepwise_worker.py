@@ -626,7 +626,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             cuda_allocated_mb=cuda_allocated_mb,
             cuda_reserved_mb=cuda_reserved_mb,
         )
-        logger.debug(f"Step execution donw plan_id={plan.plan_id} request_ids={plan.request_ids}, stepwise step metric: {step_metric}")
+        logger.debug(f"Step execution done plan_id={plan.plan_id} request_ids={plan.request_ids}, stepwise step metric: {step_metric}")
         # logger.info("Step execution done plan_id=%s request_ids=%s", plan.plan_id, plan.request_ids)
 
         return StepExecutionResult(
