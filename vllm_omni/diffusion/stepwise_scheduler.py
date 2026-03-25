@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 import uuid
 from collections import deque
@@ -110,10 +109,10 @@ class StepwiseScheduler:
 
         self._pending: deque[tuple[OmniDiffusionRequest, RequestRuntimeState]] = deque()
         self._active: dict[str, RequestRuntimeState] = {}
-        self._max_bsz = int(os.getenv("VLLM_OMNI_STEPWISE_MAX_BSZ", "32"))
+        self._max_bsz = int(od_config.max_step_batch_size)
         if self._max_bsz <= 0:
-            logger.error("Invalid VLLM_OMNI_STEPWISE_MAX_BSZ=%d", self._max_bsz)
-            raise ValueError(f"Invalid VLLM_OMNI_STEPWISE_MAX_BSZ={self._max_bsz}")
+            logger.error("Invalid max_step_batch_size=%d", self._max_bsz)
+            raise ValueError(f"Invalid max_step_batch_size={self._max_bsz}")
 
     def initialize_result_queue(self, handle) -> None:
         self.result_mq = MessageQueue.create_from_handle(handle, rank=0)

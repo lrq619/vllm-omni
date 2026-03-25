@@ -218,6 +218,13 @@ class OmniServeCommand(CLISubcommand):
             help="Enable explicit step-wise diffusion runtime (default: disabled).",
         )
         omni_config_group.add_argument(
+            "--max-step-batch-size",
+            dest="max_step_batch_size",
+            type=int,
+            default=8,
+            help="Maximum batch size used by stepwise scheduler and worker tensor pools (default: 8).",
+        )
+        omni_config_group.add_argument(
             "--usp",
             "--ulysses-degree",
             dest="ulysses_degree",

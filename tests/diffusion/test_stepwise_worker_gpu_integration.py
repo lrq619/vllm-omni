@@ -142,7 +142,7 @@ def test_stepwise_worker_staggered_32_requests_gpu():
             output_type="pil",
             extra_args={"noise_level": 0.7, "sde_type": "sde", "logprobs": True},
         )
-        prompt_ids = list(range(80))
+        prompt_ids = list(range(20))
         prompt_mask = [1] * len(prompt_ids)
 
         futures = []

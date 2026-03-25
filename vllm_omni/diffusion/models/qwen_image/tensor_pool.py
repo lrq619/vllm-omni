@@ -6,6 +6,15 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _cuda_mem_mb(device: torch.device) -> tuple[float, float]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return 0.0, 0.0
+    torch.cuda.synchronize(device)
+    allocated = torch.cuda.memory_allocated(device) / (1024 * 1024)
+    reserved = torch.cuda.memory_reserved(device) / (1024 * 1024)
+    return float(allocated), float(reserved)
+
+
 class TensorPool:
     def __init__(
         self,
@@ -192,12 +201,28 @@ class TensorPoolManager:
             logger.error("TensorPool `%s` already exists.", name)
             raise ValueError(f"TensorPool `{name}` already exists.")
 
+        device_obj = torch.device(device)
+        before_alloc_mb, before_reserved_mb = _cuda_mem_mb(device_obj)
         self.pools[name] = TensorPool(
             max_bsz=self.max_bsz,
             shape=shape,
             dtype=dtype,
-            device=device,
+            device=device_obj,
         )
+        after_alloc_mb, after_reserved_mb = _cuda_mem_mb(device_obj)
+        if device_obj.type == "cuda" and torch.cuda.is_available():
+            logger.info(
+                "TensorPool `%s` created on %s: allocated %.2f MB -> %.2f MB (+%.2f MB), "
+                "reserved %.2f MB -> %.2f MB (+%.2f MB)",
+                name,
+                device_obj,
+                before_alloc_mb,
+                after_alloc_mb,
+                after_alloc_mb - before_alloc_mb,
+                before_reserved_mb,
+                after_reserved_mb,
+                after_reserved_mb - before_reserved_mb,
+            )
 
     def alloc(self, num_rows: int) -> list[int]:
         if num_rows < 0:

@@ -320,6 +320,9 @@ class OmniDiffusionConfig:
     # When enabled, executor uses StepwiseScheduler and DiffusionStepwiseWorker.
     enable_stepwise: bool = False
 
+    # Maximum batch size used by the stepwise scheduler and worker-side tensor pools.
+    max_step_batch_size: int = 8
+
     dtype: torch.dtype = torch.bfloat16
 
     tf_model_config: TransformerConfig = field(default_factory=TransformerConfig)
