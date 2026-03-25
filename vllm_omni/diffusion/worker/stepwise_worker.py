@@ -285,7 +285,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             negative_prompt_ids = custom_prompt.get("negative_prompt_ids")
             negative_prompt_mask = custom_prompt.get("negative_prompt_mask")
             if prompt_ids is None:
-                logger.error("Missing prompt_ids in request_id=%s", request_id)
+                logger.warning("Missing prompt_ids in request_id=%s", request_id)
                 manager.release([row_index])
                 return AdmissionResult(
                     request_id=request_id,
