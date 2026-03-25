@@ -348,7 +348,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             if pipeline.transformer.guidance_embeds:
                 guidance = torch.full((1, 1), float(sp.guidance_scale), dtype=torch.float32, device=pipeline.device)
             else:
-                guidance = torch.zeros((1, 1), dtype=torch.float32, device=pipeline.device)
+                guidance = None
 
             if sde_window_size is not None:
                 if not isinstance(sde_window_range, (tuple, list)) or len(sde_window_range) != 2:
@@ -378,14 +378,16 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             self._ensure_pool("prompt_embeds_mask", prompt_embeds_mask)
             self._ensure_pool("negative_prompt_embeds", negative_prompt_embeds)
             self._ensure_pool("negative_prompt_embeds_mask", negative_prompt_embeds_mask)
-            self._ensure_pool("guidance", guidance)
+            if guidance is not None:
+                self._ensure_pool("guidance", guidance)
 
             manager.put("latents", [row_index], latents)
             manager.put("prompt_embeds", [row_index], prompt_embeds)
             manager.put("prompt_embeds_mask", [row_index], prompt_embeds_mask)
             manager.put("negative_prompt_embeds", [row_index], negative_prompt_embeds)
             manager.put("negative_prompt_embeds_mask", [row_index], negative_prompt_embeds_mask)
-            manager.put("guidance", [row_index], guidance)
+            if guidance is not None:
+                manager.put("guidance", [row_index], guidance)
 
             self._states[request_id] = WorkerRequestState(
                 request_id=request_id,
@@ -459,7 +461,9 @@ class DiffusionStepwiseWorker(DiffusionWorker):
         prompt_embeds_mask = manager.get("prompt_embeds_mask", row_indices)
         negative_prompt_embeds = manager.get("negative_prompt_embeds", row_indices)
         negative_prompt_embeds_mask = manager.get("negative_prompt_embeds_mask", row_indices)
-        guidance = manager.get("guidance", row_indices).squeeze(-1)
+        guidance = None
+        if pipeline.transformer.guidance_embeds:
+            guidance = manager.get("guidance", row_indices).squeeze(-1)
 
         timesteps = torch.tensor(plan.timesteps, dtype=latents.dtype, device=latents.device)
         img_shapes = [self._states[r].img_shapes for r in plan.request_ids]
@@ -470,17 +474,19 @@ class DiffusionStepwiseWorker(DiffusionWorker):
         pipeline._current_timestep = None
         pipeline.transformer.do_true_cfg = False
 
-        noise_pred = pipeline.transformer(
+        transformer_kwargs = dict(
             hidden_states=latents,
             timestep=timesteps / 1000,
-            guidance=guidance,
             encoder_hidden_states_mask=prompt_embeds_mask,
             encoder_hidden_states=prompt_embeds,
             img_shapes=img_shapes,
             txt_seq_lens=txt_seq_lens,
             attention_kwargs=pipeline.attention_kwargs,
             return_dict=False,
-        )[0]
+        )
+        if guidance is not None:
+            transformer_kwargs["guidance"] = guidance
+        noise_pred = pipeline.transformer(**transformer_kwargs)[0]
 
         cfg_indices = [i for i, req_id in enumerate(plan.request_ids) if self._states[req_id].do_true_cfg]
         if cfg_indices:
@@ -490,17 +496,19 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             if any(x is None for x in neg_txt_seq_lens):
                 raise RuntimeError("CFG request is missing negative_txt_seq_len.")
 
-            neg_noise_pred = pipeline.transformer(
+            neg_transformer_kwargs = dict(
                 hidden_states=latents[idx_tensor],
                 timestep=timesteps[idx_tensor] / 1000,
-                guidance=guidance[idx_tensor],
                 encoder_hidden_states_mask=negative_prompt_embeds_mask[idx_tensor],
                 encoder_hidden_states=negative_prompt_embeds[idx_tensor],
                 img_shapes=neg_img_shapes,
                 txt_seq_lens=[int(x) for x in neg_txt_seq_lens],
                 attention_kwargs=pipeline.attention_kwargs,
                 return_dict=False,
-            )[0]
+            )
+            if guidance is not None:
+                neg_transformer_kwargs["guidance"] = guidance[idx_tensor]
+            neg_noise_pred = pipeline.transformer(**neg_transformer_kwargs)[0]
 
             for local_idx, batch_idx in enumerate(cfg_indices):
                 req_id = plan.request_ids[batch_idx]
