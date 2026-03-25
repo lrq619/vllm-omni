@@ -264,7 +264,15 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             negative_prompt_mask = custom_prompt.get("negative_prompt_mask")
             if prompt_ids is None:
                 logger.error("Missing prompt_ids in request_id=%s", request_id)
-                raise RuntimeError(f"Missing prompt_ids in request_id={request_id}")
+                manager.release([row_index])
+                return AdmissionResult(
+                    request_id=request_id,
+                    row_indices=[],
+                    max_steps=0,
+                    current_timestep=0.0,
+                    admitted=False,
+                    rejection_reason=f"Missing prompt_ids in request_id={request_id}",
+                )
 
             sp = request.sampling_params
             height = sp.height or pipeline.default_sample_size * pipeline.vae_scale_factor

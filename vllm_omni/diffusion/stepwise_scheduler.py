@@ -27,6 +27,8 @@ class AdmissionResult:
     row_indices: list[int]
     max_steps: int
     current_timestep: float
+    admitted: bool = True
+    rejection_reason: str | None = None
 
 
 @dataclass
@@ -178,6 +180,13 @@ class StepwiseScheduler:
         if not isinstance(result, AdmissionResult):
             logger.error("Admission returned invalid type=%s request_id=%s", type(result).__name__, request_id)
             raise RuntimeError(f"Invalid admission result type={type(result).__name__} request_id={request_id}")
+        if not result.admitted:
+            logger.warning(
+                "Admission rejected request_id=%s reason=%s",
+                request_id,
+                result.rejection_reason,
+            )
+            return result
         logger.info(
             "Admission end request_id=%s rows=%s max_steps=%d first_t=%.6f",
             request_id,
@@ -346,6 +355,17 @@ class StepwiseScheduler:
                         request, state = self._pending.popleft()
                     try:
                         admission = self._admit_local(request, state)
+                        if not admission.admitted:
+                            state.status = "finished"
+                            state.finish_reason = "admission_rejected"
+                            state.result = DiffusionOutput(output=None, custom_output={})
+                            self._resolve_future(state, state.result)
+                            logger.info(
+                                "Admission rejected request_id=%s; returned dummy DiffusionOutput. reason=%s",
+                                state.request_id,
+                                admission.rejection_reason,
+                            )
+                            continue
                         state.status = "active"
                         state.row_indices = admission.row_indices
                         state.max_steps = admission.max_steps
