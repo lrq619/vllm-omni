@@ -4,14 +4,16 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, field
+import time
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwenimage_step import (
-    QwenImagePipelineWithLogProb,
+    QwenImagePipelineWithLogProbStep,
 )
 from vllm_omni.diffusion.models.qwen_image.tensor_pool import TensorPoolManager
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -53,6 +55,84 @@ class WorkerRequestState:
     collected_timesteps: list[torch.Tensor] = field(default_factory=list)
 
 
+@dataclass
+class StepwisePlanMetric:
+    timestamp_ms: float
+    plan_id: str
+    batch_size: int
+    request_ids: list[str]
+    row_indices: list[int]
+    step_indices: list[int]
+    finished_count: int
+    latency_ms: float
+
+
+class StepwiseWorkerMetric:
+    def __init__(self) -> None:
+        self._plan_metrics: list[StepwisePlanMetric] = []
+
+    def reset(self) -> None:
+        self._plan_metrics.clear()
+
+    def record_plan(
+        self,
+        *,
+        plan_id: str,
+        request_ids: list[str],
+        row_indices: list[int],
+        step_indices: list[int],
+        finished_count: int,
+        latency_ms: float,
+    ) -> dict[str, Any]:
+        metric = StepwisePlanMetric(
+            timestamp_ms=time.time() * 1000.0,
+            plan_id=plan_id,
+            batch_size=len(request_ids),
+            request_ids=list(request_ids),
+            row_indices=list(row_indices),
+            step_indices=list(step_indices),
+            finished_count=int(finished_count),
+            latency_ms=float(latency_ms),
+        )
+        self._plan_metrics.append(metric)
+        return asdict(metric)
+
+    def dump_json(self) -> dict[str, Any]:
+        total_plans = len(self._plan_metrics)
+        if total_plans == 0:
+            return {
+                "summary": {
+                    "total_plans": 0,
+                    "avg_batch_size": 0.0,
+                    "max_batch_size": 0,
+                    "avg_latency_ms": 0.0,
+                },
+                "plans": [],
+            }
+        batch_sizes = [m.batch_size for m in self._plan_metrics]
+        latencies = [m.latency_ms for m in self._plan_metrics]
+        return {
+            "summary": {
+                "total_plans": total_plans,
+                "avg_batch_size": float(sum(batch_sizes) / total_plans),
+                "max_batch_size": int(max(batch_sizes)),
+                "avg_latency_ms": float(sum(latencies) / total_plans),
+            },
+            "plans": [asdict(m) for m in self._plan_metrics],
+        }
+
+    def dump_str(self) -> str:
+        payload = self.dump_json()
+        summary = payload["summary"]
+        return (
+            "StepwiseWorkerMetric("
+            f"total_plans={summary['total_plans']}, "
+            f"avg_batch_size={summary['avg_batch_size']:.2f}, "
+            f"max_batch_size={summary['max_batch_size']}, "
+            f"avg_latency_ms={summary['avg_latency_ms']:.3f})"
+        )
+
+
 def _maybe_to_cpu(v):
     if isinstance(v, torch.Tensor):
         return v.detach().cpu()
@@ -84,17 +164,18 @@ class DiffusionStepwiseWorker(DiffusionWorker):
         self._states: dict[str, WorkerRequestState] = {}
         self._max_bsz: int | None = None
         self._pool_specs: dict[str, tuple[tuple[int, ...], torch.dtype, torch.device]] = {}
+        self._metrics = StepwiseWorkerMetric()
 
-    def _pipeline(self) -> QwenImagePipelineWithLogProb:
+    def _pipeline(self) -> QwenImagePipelineWithLogProbStep:
         assert self.model_runner is not None, "Model runner not initialized"
         pipeline = self.model_runner.pipeline
-        if not isinstance(pipeline, QwenImagePipelineWithLogProb):
+        if not isinstance(pipeline, QwenImagePipelineWithLogProbStep):
             logger.error(
-                "Stepwise worker requires QwenImagePipelineWithLogProb, got %s",
+                "Stepwise worker requires QwenImagePipelineWithLogProbStep, got %s",
                 type(pipeline).__name__,
             )
             raise TypeError(
-                f"Stepwise worker requires QwenImagePipelineWithLogProb, got {type(pipeline).__name__}."
+                f"Stepwise worker requires QwenImagePipelineWithLogProbStep, got {type(pipeline).__name__}."
             )
         return pipeline
 
@@ -105,9 +186,13 @@ class DiffusionStepwiseWorker(DiffusionWorker):
         self._manager = TensorPoolManager(max_bsz=max_bsz)
         self._states.clear()
         self._pool_specs.clear()
+        self._metrics.reset()
         self._max_bsz = max_bsz
         logger.info("StepwiseWorker runtime initialized with max_bsz=%d", max_bsz)
         return {"max_bsz": max_bsz}
+
+    def export_metric(self) -> StepwiseWorkerMetric:
+        return self._metrics
 
     def _ensure_runtime(self) -> TensorPoolManager:
         if self._manager is None:
@@ -335,6 +420,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             raise
 
     def stepwise_execute_plan(self, plan: SchedulerBatchPlan) -> StepExecutionResult:
+        start_time = time.perf_counter()
         manager = self._ensure_runtime()
         pipeline = self._pipeline()
         if not plan.request_ids:
@@ -460,6 +546,16 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 next_timesteps.append(float(state.timesteps[state.step_idx]))
 
         manager.put("latents", row_indices, torch.cat(next_latents, dim=0))
+        latency_ms = (time.perf_counter() - start_time) * 1000.0
+        step_metric = self._metrics.record_plan(
+            plan_id=plan.plan_id,
+            request_ids=plan.request_ids,
+            row_indices=row_indices,
+            step_indices=next_step_indices,
+            finished_count=sum(1 for x in finished if x),
+            latency_ms=latency_ms,
+        )
+        logger.debug("Stepwise step metric: %s", step_metric)
         logger.info("Step execution done plan_id=%s request_ids=%s", plan.plan_id, plan.request_ids)
 
         return StepExecutionResult(
