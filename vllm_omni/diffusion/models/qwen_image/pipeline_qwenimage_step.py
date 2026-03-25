@@ -43,7 +43,7 @@ def _maybe_to_cpu(v):
     return v
 
 
-class QwenImagePipelineWithLogProb(QwenImagePipeline):
+class QwenImagePipelineWithLogProbStep(QwenImagePipeline):
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super(QwenImagePipeline, self).__init__()
         self.od_config = od_config

@@ -222,6 +222,24 @@ class TensorPoolManager:
         self._allocated[selected] = True
         return selected.tolist()
 
+    def reserve(self, indicies: list[int]) -> None:
+        """
+        Reserve specific rows explicitly.
+
+        This is useful when an external coordinator (e.g., scheduler) assigns
+        deterministic row indices and the local manager must mirror that state.
+        """
+        idx = self._validate_indicies(indicies)
+        if not idx:
+            return
+        idx_tensor = torch.tensor(idx, dtype=torch.long)
+        already_allocated = idx_tensor[self._allocated[idx_tensor]]
+        if already_allocated.numel() > 0:
+            rows = already_allocated.tolist()
+            logger.error("Cannot reserve rows that are already allocated. rows=%s", rows)
+            raise RuntimeError(f"Cannot reserve rows that are already allocated. rows={rows}")
+        self._allocated[idx_tensor] = True
+
     def release(self, indicies: list[int]) -> None:
         idx = self._validate_indicies(indicies)
         if not idx:

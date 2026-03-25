@@ -364,9 +364,16 @@ class WorkerProc:
         custom_pipeline_args: dict[str, Any] | None = None,
     ) -> DiffusionWorker:
         """Create a worker instance. Override in subclasses for different worker types."""
+        base_worker_class: type[DiffusionWorker] = DiffusionWorker
+        if od_config.enable_stepwise:
+            from vllm_omni.diffusion.worker.stepwise_worker import DiffusionStepwiseWorker
+
+            base_worker_class = DiffusionStepwiseWorker
+
         wrapper = WorkerWrapperBase(
             gpu_id=gpu_id,
             od_config=od_config,
+            base_worker_class=base_worker_class,
             worker_extension_cls=worker_extension_cls,
             custom_pipeline_args=custom_pipeline_args,
         )
