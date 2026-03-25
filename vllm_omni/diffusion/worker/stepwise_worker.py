@@ -27,6 +27,15 @@ from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 logger = init_logger(__name__)
 
 
+def _cuda_mem_mb(device: torch.device) -> tuple[float, float]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return 0.0, 0.0
+    torch.cuda.synchronize(device)
+    allocated = torch.cuda.memory_allocated(device) / (1024 * 1024)
+    reserved = torch.cuda.memory_reserved(device) / (1024 * 1024)
+    return float(allocated), float(reserved)
+
+
 @dataclass
 class WorkerRequestState:
     request_id: str
@@ -65,6 +74,8 @@ class StepwisePlanMetric:
     step_indices: list[int]
     finished_count: int
     latency_ms: float
+    cuda_allocated_mb: float
+    cuda_reserved_mb: float
 
 
 class StepwiseWorkerMetric:
@@ -83,6 +94,8 @@ class StepwiseWorkerMetric:
         step_indices: list[int],
         finished_count: int,
         latency_ms: float,
+        cuda_allocated_mb: float,
+        cuda_reserved_mb: float,
     ) -> dict[str, Any]:
         metric = StepwisePlanMetric(
             timestamp_ms=time.time() * 1000.0,
@@ -93,6 +106,8 @@ class StepwiseWorkerMetric:
             step_indices=list(step_indices),
             finished_count=int(finished_count),
             latency_ms=float(latency_ms),
+            cuda_allocated_mb=float(cuda_allocated_mb),
+            cuda_reserved_mb=float(cuda_reserved_mb),
         )
         self._plan_metrics.append(metric)
         return asdict(metric)
@@ -106,17 +121,22 @@ class StepwiseWorkerMetric:
                     "avg_batch_size": 0.0,
                     "max_batch_size": 0,
                     "avg_latency_ms": 0.0,
+                    "latest_cuda_allocated_mb": 0.0,
+                    "latest_cuda_reserved_mb": 0.0,
                 },
                 "plans": [],
             }
         batch_sizes = [m.batch_size for m in self._plan_metrics]
         latencies = [m.latency_ms for m in self._plan_metrics]
+        latest = self._plan_metrics[-1]
         return {
             "summary": {
                 "total_plans": total_plans,
                 "avg_batch_size": float(sum(batch_sizes) / total_plans),
                 "max_batch_size": int(max(batch_sizes)),
                 "avg_latency_ms": float(sum(latencies) / total_plans),
+                "latest_cuda_allocated_mb": float(latest.cuda_allocated_mb),
+                "latest_cuda_reserved_mb": float(latest.cuda_reserved_mb),
             },
             "plans": [asdict(m) for m in self._plan_metrics],
         }
@@ -129,7 +149,9 @@ class StepwiseWorkerMetric:
             f"total_plans={summary['total_plans']}, "
             f"avg_batch_size={summary['avg_batch_size']:.2f}, "
             f"max_batch_size={summary['max_batch_size']}, "
-            f"avg_latency_ms={summary['avg_latency_ms']:.3f})"
+            f"avg_latency_ms={summary['avg_latency_ms']:.3f}, "
+            f"latest_cuda_allocated_mb={summary['latest_cuda_allocated_mb']:.2f}, "
+            f"latest_cuda_reserved_mb={summary['latest_cuda_reserved_mb']:.2f})"
         )
 
 
@@ -593,6 +615,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
 
         manager.put("latents", row_indices, torch.cat(next_latents, dim=0))
         latency_ms = (time.perf_counter() - start_time) * 1000.0
+        cuda_allocated_mb, cuda_reserved_mb = _cuda_mem_mb(latents.device)
         step_metric = self._metrics.record_plan(
             plan_id=plan.plan_id,
             request_ids=plan.request_ids,
@@ -600,9 +623,11 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             step_indices=next_step_indices,
             finished_count=sum(1 for x in finished if x),
             latency_ms=latency_ms,
+            cuda_allocated_mb=cuda_allocated_mb,
+            cuda_reserved_mb=cuda_reserved_mb,
         )
-        logger.debug("Stepwise step metric: %s", step_metric)
-        logger.info("Step execution done plan_id=%s request_ids=%s", plan.plan_id, plan.request_ids)
+        logger.debug(f"Step execution donw plan_id={plan.plan_id} request_ids={plan.request_ids}, stepwise step metric: {step_metric}")
+        # logger.info("Step execution done plan_id=%s request_ids=%s", plan.plan_id, plan.request_ids)
 
         return StepExecutionResult(
             plan_id=plan.plan_id,
