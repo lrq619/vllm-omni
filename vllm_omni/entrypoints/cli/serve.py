@@ -209,6 +209,15 @@ class OmniServeCommand(CLISubcommand):
             help="Override the diffusion pipeline class name (e.g. LTX2ImageToVideoPipeline).",
         )
         omni_config_group.add_argument(
+            "--step-wise",
+            "--enable-step-wise",
+            "--enable_step_wise",
+            dest="enable_stepwise",
+            action="store_true",
+            default=False,
+            help="Enable explicit step-wise diffusion runtime (default: disabled).",
+        )
+        omni_config_group.add_argument(
             "--usp",
             "--ulysses-degree",
             dest="ulysses_degree",

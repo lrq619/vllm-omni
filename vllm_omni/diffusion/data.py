@@ -316,6 +316,10 @@ class OmniDiffusionConfig:
 
     model_class_name: str | None = None
 
+    # Explicitly enable step-wise diffusion runtime.
+    # When enabled, executor uses StepwiseScheduler and DiffusionStepwiseWorker.
+    enable_stepwise: bool = False
+
     dtype: torch.dtype = torch.bfloat16
 
     tf_model_config: TransformerConfig = field(default_factory=TransformerConfig)

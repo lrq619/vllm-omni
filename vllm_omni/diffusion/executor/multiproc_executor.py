@@ -10,6 +10,7 @@ from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.scheduler import Scheduler
+from vllm_omni.diffusion.stepwise_scheduler import StepwiseScheduler
 from vllm_omni.diffusion.worker import WorkerProc
 
 logger = init_logger(__name__)
@@ -21,7 +22,7 @@ class BackgroundResources:
     Used as a finalizer for clean shutdown.
     """
 
-    scheduler: Scheduler | None = None
+    scheduler: Scheduler | StepwiseScheduler | None = None
     processes: list[mp.Process] | None = None
 
     def __call__(self):
@@ -52,7 +53,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._closed = False
 
         # Initialize scheduler
-        self.scheduler = Scheduler()
+        if self.od_config.enable_stepwise:
+            logger.info("Using StepwiseScheduler (enable_stepwise=True)")
+            self.scheduler = StepwiseScheduler()
+        else:
+            self.scheduler = Scheduler()
         self.scheduler.initialize(self.od_config)
         broadcast_handle = self.scheduler.get_broadcast_handle()
 
