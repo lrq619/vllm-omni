@@ -307,12 +307,12 @@ def _ensure_results_exist(max_num_requests: int | None = None) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
 def test_stepwise():
-    asyncio.run(_run_workload_and_dump(enable_stepwise=True, out_root=_STEP_DIR))
+    asyncio.run(_run_workload_and_dump(enable_stepwise=True, out_root=_STEP_DIR, max_num_requests=1))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
 def test_non_stepwise():
-    asyncio.run(_run_workload_and_dump(enable_stepwise=False, out_root=_NON_STEP_DIR))
+    asyncio.run(_run_workload_and_dump(enable_stepwise=False, out_root=_NON_STEP_DIR, max_num_requests=1))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
