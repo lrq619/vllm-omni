@@ -41,6 +41,7 @@ _SIMPLE_PROMPTS = [
     "A cup of coffee on a desk.",
 ]
 _PROMPTS = [f"{_SYSTEM_PROMPT_PREFIX} {p}" for p in _SIMPLE_PROMPTS]
+_NEG_PROMPTS = [f"{_SYSTEM_PROMPT_PREFIX} happy happy happy happy happy happy" for _ in _SIMPLE_PROMPTS]
 
 
 def _to_image_tensor(t: torch.Tensor) -> torch.Tensor:
@@ -146,7 +147,7 @@ def _write_request_result(
     req_index: int,
     prompt_text: str,
     prompt_ids: list[int],
-    prompt_mask: list[int],
+    negative_prompt_ids: list[int],
     output: OmniRequestOutput,
 ) -> None:
     req_dir = out_root / f"req_{req_index}"
@@ -164,7 +165,7 @@ def _write_request_result(
         "request_id": output.request_id,
         "prompt_text": prompt_text,
         "prompt_ids": prompt_ids,
-        "prompt_mask": prompt_mask,
+        "negative_prompt_ids": negative_prompt_ids,
         "image_path": str(image_path),
         "output_tensor": _serialize_tensor(output_tensor),
         "custom_output": _serialize_obj(custom_output),
@@ -183,6 +184,7 @@ async def _run_workload_and_dump(
 
     tokenizer = _load_tokenizer_from_model(model)
     prompts = _PROMPTS if max_num_requests is None else _PROMPTS[:max_num_requests]
+    negative_prompts = _NEG_PROMPTS if max_num_requests is None else _NEG_PROMPTS[:max_num_requests]
     if len(prompts) != _REQUEST_NUM:
         if max_num_requests is None:
             raise RuntimeError(f"Expected {_REQUEST_NUM} prompts, got {len(prompts)}")
@@ -199,16 +201,18 @@ async def _run_workload_and_dump(
         for i, text in enumerate(prompts):
             token_ids = tokenizer.encode(text, add_special_tokens=True)
             prompt_ids = [int(x) for x in token_ids]
+            negative_token_ids = tokenizer.encode(negative_prompts[i], add_special_tokens=True)
+            negative_prompt_ids = [int(x) for x in negative_token_ids]
             prompt_mask = [1] * len(prompt_ids)
             sampling_params = OmniDiffusionSamplingParams(
-                num_inference_steps=20,
-                guidance_scale=1.0,
-                true_cfg_scale=1.0,
-                width=256,
-                height=256,
+                num_inference_steps=10,
+                # guidance_scale=1.0,
+                true_cfg_scale=4.0,
+                width=512,
+                height=512,
                 output_type="pil",
-                seed=1000 + i,
-                extra_args={"noise_level": 0.7, "sde_type": "sde", "logprobs": True},
+                seed=42,
+                extra_args={"noise_level": 1, "sde_type": "sde", "logprobs": True, "sde_window_size": 2, "sde_window_range": [0,5]},
             )
             request_id = f"gpu-async-{'step' if enable_stepwise else 'non-step'}-{i:02d}"
 
@@ -217,12 +221,12 @@ async def _run_workload_and_dump(
                 prompt_text: str,
                 req_id: str,
                 req_prompt_ids: list[int],
-                req_prompt_mask: list[int],
+                neg_prompt_ids: list[int],
                 sp: OmniDiffusionSamplingParams,
             ) -> None:
                 final_output: OmniRequestOutput | None = None
                 async for out in omni.generate(
-                    prompt={"prompt_ids": req_prompt_ids, "prompt_mask": req_prompt_mask},
+                    prompt={"prompt_ids": req_prompt_ids, "negative_prompt_ids": neg_prompt_ids},
                     request_id=req_id,
                     sampling_params_list=[sp],
                 ):
@@ -234,12 +238,12 @@ async def _run_workload_and_dump(
                     req_index=req_index,
                     prompt_text=prompt_text,
                     prompt_ids=req_prompt_ids,
-                    prompt_mask=req_prompt_mask,
+                    negative_prompt_ids=neg_prompt_ids,
                     output=final_output,
                 )
 
             tasks.append(
-                asyncio.create_task(_one_request(i, text, request_id, prompt_ids, prompt_mask, sampling_params))
+                asyncio.create_task(_one_request(i, text, request_id, prompt_ids, negative_prompt_ids, sampling_params))
             )
             await asyncio.sleep(_REQUEST_INTERVAL_S)
 
