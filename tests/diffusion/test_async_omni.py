@@ -167,15 +167,22 @@ def _write_request_result(
     (req_dir / "result.json").write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
 
 
-async def _run_workload_and_dump(enable_stepwise: bool, out_root: Path) -> None:
+async def _run_workload_and_dump(
+    enable_stepwise: bool,
+    out_root: Path,
+    max_num_requests: int | None = None,
+) -> None:
     model = os.getenv("VLLM_OMNI_STEPWISE_TEST_MODEL")
     if not model:
         pytest.skip("Set VLLM_OMNI_STEPWISE_TEST_MODEL to a valid stepwise-capable model path/name.")
 
     tokenizer = _load_tokenizer_from_model(model)
-    prompts = _PROMPTS
+    prompts = _PROMPTS if max_num_requests is None else _PROMPTS[:max_num_requests]
     if len(prompts) != _REQUEST_NUM:
-        raise RuntimeError(f"Expected {_REQUEST_NUM} prompts, got {len(prompts)}")
+        if max_num_requests is None:
+            raise RuntimeError(f"Expected {_REQUEST_NUM} prompts, got {len(prompts)}")
+        if max_num_requests < 0:
+            raise ValueError(f"max_num_requests must be >= 0, got {max_num_requests}")
 
     if out_root.exists():
         shutil.rmtree(out_root)
@@ -288,13 +295,14 @@ def _compare_tensor_payloads(a: dict[str, Any], b: dict[str, Any], tensor_name: 
         assert torch.equal(ta, tb), f"Non-floating tensor mismatch for {tensor_name}"
 
 
-def _ensure_results_exist() -> None:
-    step_ok = all((_STEP_DIR / f"req_{i}" / "result.json").exists() for i in range(_REQUEST_NUM))
-    non_step_ok = all((_NON_STEP_DIR / f"req_{i}" / "result.json").exists() for i in range(_REQUEST_NUM))
+def _ensure_results_exist(max_num_requests: int | None = None) -> None:
+    num_requests = _REQUEST_NUM if max_num_requests is None else max_num_requests
+    step_ok = all((_STEP_DIR / f"req_{i}" / "result.json").exists() for i in range(num_requests))
+    non_step_ok = all((_NON_STEP_DIR / f"req_{i}" / "result.json").exists() for i in range(num_requests))
     if not step_ok:
-        asyncio.run(_run_workload_and_dump(enable_stepwise=True, out_root=_STEP_DIR))
+        asyncio.run(_run_workload_and_dump(enable_stepwise=True, out_root=_STEP_DIR, max_num_requests=max_num_requests))
     if not non_step_ok:
-        asyncio.run(_run_workload_and_dump(enable_stepwise=False, out_root=_NON_STEP_DIR))
+        asyncio.run(_run_workload_and_dump(enable_stepwise=False, out_root=_NON_STEP_DIR, max_num_requests=max_num_requests))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
