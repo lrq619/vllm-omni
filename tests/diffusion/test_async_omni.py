@@ -26,9 +26,16 @@ _REQUEST_NUM = 8
 _REQUEST_INTERVAL_S = 2.0
 _STEP_DIR = Path("output/step_results")
 _NON_STEP_DIR = Path("output/non_step_results")
-_SYSTEM_PROMPT_PREFIX = (
-    "Describe the image by detailing the color, shape, size, "
-    "texture, quantity, text, spatial relationships of the objects and background: happy happy happy happy"
+_TOKENIZER_MAX_LENGTH = 1024
+_PROMPT_TEMPLATE_ENCODE_START_IDX = 34
+_APPLY_CHAT_TEMPLATE_KWARGS = {
+    "max_length": _TOKENIZER_MAX_LENGTH + _PROMPT_TEMPLATE_ENCODE_START_IDX,
+    "padding": True,
+    "truncation": True,
+}
+_SYSTEM_PROMPT = (
+    "Describe the image by detailing the color, shape, size, texture, quantity, text, "
+    "spatial relationships of the objects and background:"
 )
 _SIMPLE_PROMPTS = [
     "A red apple on a wooden table.",
@@ -40,8 +47,8 @@ _SIMPLE_PROMPTS = [
     "A city street after light rain.",
     "A cup of coffee on a desk.",
 ]
-_PROMPTS = [f"{_SYSTEM_PROMPT_PREFIX} {p}" for p in _SIMPLE_PROMPTS]
-_NEG_PROMPTS = [f"{_SYSTEM_PROMPT_PREFIX} happy happy happy happy happy happy" for _ in _SIMPLE_PROMPTS]
+_PROMPTS = _SIMPLE_PROMPTS
+_NEG_PROMPTS = [" " for _ in _SIMPLE_PROMPTS]
 
 
 def _to_image_tensor(t: torch.Tensor) -> torch.Tensor:
@@ -70,6 +77,32 @@ def _load_tokenizer_from_model(model: str):
     if not tokenizer_dir.exists():
         pytest.skip(f"Expected tokenizer at '{tokenizer_dir}', but it does not exist.")
     return AutoTokenizer.from_pretrained(str(tokenizer_dir), local_files_only=True, trust_remote_code=True)
+
+
+def _normalize_token_ids(tokenized_output: Any) -> list[int]:
+    token_ids = tokenized_output
+    if isinstance(tokenized_output, dict) and "input_ids" in tokenized_output:
+        token_ids = tokenized_output["input_ids"]
+    elif hasattr(tokenized_output, "input_ids"):
+        token_ids = tokenized_output.input_ids
+
+    if hasattr(token_ids, "tolist"):
+        token_ids = token_ids.tolist()
+    if isinstance(token_ids, tuple):
+        token_ids = list(token_ids)
+    if isinstance(token_ids, list) and len(token_ids) == 1 and isinstance(token_ids[0], (list, tuple)):
+        token_ids = list(token_ids[0])
+    return [int(x.item() if hasattr(x, "item") else x) for x in token_ids]
+
+
+def _chat_template_to_ids(tokenizer, messages):
+    token_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        **_APPLY_CHAT_TEMPLATE_KWARGS,
+    )
+    return _normalize_token_ids(token_ids), None
 
 
 def _create_async_omni(model: str, enable_stepwise: bool) -> AsyncOmni:
@@ -199,11 +232,16 @@ async def _run_workload_and_dump(
     try:
         tasks = []
         for i, text in enumerate(prompts):
-            token_ids = tokenizer.encode(text, add_special_tokens=True)
-            prompt_ids = [int(x) for x in token_ids]
-            negative_token_ids = tokenizer.encode(negative_prompts[i], add_special_tokens=True)
-            negative_prompt_ids = [int(x) for x in negative_token_ids]
-            prompt_mask = [1] * len(prompt_ids)
+            prompt_messages = [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ]
+            negative_prompt_messages = [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": negative_prompts[i]},
+            ]
+            prompt_ids, prompt_mask = _chat_template_to_ids(tokenizer, prompt_messages)
+            negative_prompt_ids, negative_prompt_mask = _chat_template_to_ids(tokenizer, negative_prompt_messages)
             sampling_params = OmniDiffusionSamplingParams(
                 num_inference_steps=10,
                 # guidance_scale=1.0,
@@ -212,6 +250,7 @@ async def _run_workload_and_dump(
                 height=512,
                 output_type="pil",
                 seed=42,
+                max_sequence_length=_APPLY_CHAT_TEMPLATE_KWARGS["max_length"],
                 extra_args={"noise_level": 1, "sde_type": "sde", "logprobs": True, "sde_window_size": 2, "sde_window_range": [0,5]},
             )
             request_id = f"gpu-async-{'step' if enable_stepwise else 'non-step'}-{i:02d}"
@@ -226,7 +265,12 @@ async def _run_workload_and_dump(
             ) -> None:
                 final_output: OmniRequestOutput | None = None
                 async for out in omni.generate(
-                    prompt={"prompt_ids": req_prompt_ids, "negative_prompt_ids": neg_prompt_ids},
+                    prompt={
+                        "prompt_ids": req_prompt_ids,
+                        "prompt_mask": prompt_mask,
+                        "negative_prompt_ids": neg_prompt_ids,
+                        "negative_prompt_mask": negative_prompt_mask,
+                    },
                     request_id=req_id,
                     sampling_params_list=[sp],
                 ):
