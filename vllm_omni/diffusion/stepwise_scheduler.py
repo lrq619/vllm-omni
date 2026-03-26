@@ -128,7 +128,9 @@ class StepwiseScheduler:
         self._stop = False
         self._worker_thread = threading.Thread(target=self._main_loop, name="stepwise-scheduler", daemon=True)
         self._worker_thread.start()
-        self._started = True
+        with self._cv:
+            self._started = True
+            self._cv.notify_all()
         logger.info("StepwiseScheduler main loop started with max_bsz=%d", self._max_bsz)
 
     def get_broadcast_handle(self):
@@ -136,8 +138,22 @@ class StepwiseScheduler:
 
     def add_req(self, request: OmniDiffusionRequest) -> Future[DiffusionOutput]:
         if not self._started:
-            logger.error("StepwiseScheduler add_req called before start.")
-            raise RuntimeError("StepwiseScheduler not started.")
+            wait_timeout_s = 60.0
+            request_id = request.request_ids[0] if request.request_ids else "<missing>"
+            logger.warning(
+                "StepwiseScheduler add_req called before start; waiting up to %.1fs for initialization request_id=%s.",
+                wait_timeout_s,
+                request_id,
+            )
+            with self._cv:
+                started = self._cv.wait_for(lambda: self._started, timeout=wait_timeout_s)
+            if not started:
+                logger.error(
+                    "StepwiseScheduler did not start within %.1fs; rejecting request_id=%s.",
+                    wait_timeout_s,
+                    request_id,
+                )
+                raise RuntimeError(f"StepwiseScheduler not started after waiting {wait_timeout_s:.1f}s.")
         if not request.request_ids:
             logger.error("Request is missing request_ids for stepwise runtime.")
             raise ValueError("Stepwise runtime requires request.request_ids[0].")
