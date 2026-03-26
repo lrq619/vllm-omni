@@ -37,7 +37,7 @@ class MooncakeStore:
         self.storage_host = storage_host or os.environ.get("MOONCAKE_STORAGE_HOST", _get_hostname_ip())
         self.storage_port = storage_port or int(os.environ.get("MOONCAKE_STORAGE_PORT", "8083"))
         self.master_host = master_host or os.environ.get("MOONCAKE_MASTER_HOST", self.storage_host)
-        self.master_port = master_port or int(os.environ.get("MOONCAKE_MASTER_PORT", "10619"))
+        self.master_port = master_port or int(os.environ.get("MOONCAKE_MASTER_PORT", "50051"))
         self.protocol = protocol or os.environ.get("MOONCAKE_PROTOCOL", "tcp")
         self.node_addr = node_addr or os.environ.get("MOONCAKE_NODE_ADDR", _get_hostname_ip())
         self.local_buffer_size = local_buffer_size
