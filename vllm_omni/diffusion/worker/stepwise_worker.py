@@ -412,10 +412,8 @@ class DiffusionStepwiseWorker(DiffusionWorker):
 
                 txt_seq_len = int(prompt_embeds_mask.sum(dim=1).item())
                 negative_txt_seq_len = int(negative_prompt_embeds_mask.sum(dim=1).item()) if do_true_cfg else None
-                # Match the standard pipeline contract: per-sample list of image-shape tuples.
-                img_shapes = [
-                    [(1, height // pipeline.vae_scale_factor // 2, width // pipeline.vae_scale_factor // 2)]
-                ]
+                # QwenEmbedRope.forward() expects a flat list of (frame, height, width) tuples here.
+                img_shapes = [(1, height // pipeline.vae_scale_factor // 2, width // pipeline.vae_scale_factor // 2)]
 
                 # Ensure pools are initialized and shape-consistent.
                 self._ensure_pool("latents", latents)
