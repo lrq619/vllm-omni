@@ -144,6 +144,33 @@ def test_max_step_batch_size_wiring_paths(monkeypatch):
     assert executor.od_config.max_step_batch_size == 12
 
 
+def test_async_omni_pause_detects_stepwise_stage_from_engine_args(monkeypatch):
+    monkeypatch.setattr(
+        utils_module,
+        "get_hf_file_to_dict",
+        lambda filename, model, revision=None: {"_class_name": "QwenImagePipelineWithLogProbStep"}
+        if filename == "model_index.json"
+        else {},
+    )
+    monkeypatch.setattr(utils_module, "load_stage_configs_from_model", lambda model, base_engine_args=None: [])
+    monkeypatch.setattr(utils_module, "resolve_model_config_path", lambda model: None)
+    monkeypatch.setattr(AsyncOmni, "_start_stages", lambda self, model: None)
+    monkeypatch.setattr(AsyncOmni, "_wait_for_stages_ready", lambda self, timeout=0: None)
+
+    omni = AsyncOmni(
+        model="dummy-model",
+        enable_stepwise=True,
+        model_class_name="QwenImagePipelineWithLogProbStep",
+    )
+
+    stage = omni.stage_list[0]
+    assert stage.stage_type == "diffusion"
+    assert stage.engine is None
+
+    stepwise_stages = omni._get_stepwise_diffusion_stages()
+    assert stepwise_stages == [stage]
+
+
 def test_python_enable_stepwise_selects_stepwise_scheduler(monkeypatch):
     with _stub_modules(_make_offloader_stub_modules()):
         from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor

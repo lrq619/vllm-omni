@@ -778,9 +778,12 @@ class AsyncOmni(OmniBase):
         for stage in self.stage_list:
             if stage.stage_type != "diffusion":
                 continue
-            engine = getattr(stage, "engine", None)
-            od_config = getattr(engine, "od_config", None)
-            if od_config is None or not getattr(od_config, "enable_stepwise", False):
+            engine_args = getattr(stage, "engine_args", None)
+            if isinstance(engine_args, dict):
+                enable_stepwise = bool(engine_args.get("enable_stepwise", False))
+            else:
+                enable_stepwise = bool(getattr(engine_args, "enable_stepwise", False))
+            if not enable_stepwise:
                 continue
             stages.append(stage)
         if not stages:
