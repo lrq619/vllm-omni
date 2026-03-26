@@ -87,6 +87,11 @@ def _create_async_omni(model: str, enable_stepwise: bool) -> AsyncOmni:
         return AsyncOmni(
             model=model,
             num_gpus=1,
+            diffusion_load_format="custom_pipeline",
+            custom_pipeline_args={
+                "pipeline_class": "vllm_omni.diffusion.models.qwen_image.non_step.pipeline_qwenimage_step."
+                "QwenImagePipelineWithLogProb"
+            },
         )
 
 
