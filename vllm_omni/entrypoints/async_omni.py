@@ -4,6 +4,7 @@ import asyncio
 import copy
 import pickle
 import time
+import traceback
 import weakref
 from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
 from typing import Any, TypeVar
@@ -42,8 +43,22 @@ _R = TypeVar("_R")
 logger = init_logger(__name__)
 
 
+def _format_close_trace(limit: int = 12) -> str:
+    stack = traceback.format_stack(limit=limit)
+    if stack:
+        stack = stack[:-1]
+    return "".join(stack).rstrip()
+
+
 def _weak_close_cleanup_async(stage_list, stage_in_queues, stage_out_queues, ray_pg, output_handler, zmq_ctx=None):
     """Weak reference cleanup function for AsyncOmni instances."""
+    logger.warning(
+        "[CloseTrace] _weak_close_cleanup_async invoked stage_count=%d in_queue_count=%d out_queue_count=%d\n%s",
+        len(stage_list) if stage_list is not None else -1,
+        len(stage_in_queues) if stage_in_queues is not None else -1,
+        len(stage_out_queues) if stage_out_queues is not None else -1,
+        _format_close_trace(),
+    )
     if stage_list:
         for q in stage_in_queues:
             try:
@@ -336,6 +351,7 @@ class AsyncOmni(OmniBase):
         Alias for close() method. Cleans up all stage processes
         and inter-process communication resources.
         """
+        logger.warning("[CloseTrace] AsyncOmni.shutdown invoked\n%s", _format_close_trace())
         if hasattr(self, "_weak_finalizer"):
             self._weak_finalizer()
 
@@ -1009,6 +1025,7 @@ class AsyncOmni(OmniBase):
             return self._paused
 
     def close(self):
+        logger.warning("[CloseTrace] AsyncOmni.close invoked\n%s", _format_close_trace())
         if self._mooncake_store is not None:
             try:
                 self._mooncake_store.shutdown()

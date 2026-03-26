@@ -66,6 +66,13 @@ _R = TypeVar("_R")
 logger = init_logger(__name__)
 
 
+def _format_close_trace(limit: int = 12) -> str:
+    stack = traceback.format_stack(limit=limit)
+    if stack:
+        stack = stack[:-1]
+    return "".join(stack).rstrip()
+
+
 @contextmanager
 def _sequential_init_lock(engine_args: dict[str, Any], stage_init_timeout: int = 300):
     """Acquire device locks for sequential init if NVML is unavailable.
@@ -610,6 +617,14 @@ class OmniStage:
         If graceful shutdown fails, forcefully terminates the process.
         Handles both multiprocessing Process and Ray Actor.
         """
+        logger.warning(
+            "[CloseTrace] OmniStage.stop_stage_worker invoked stage_id=%s stage_type=%s has_in_q=%s has_out_q=%s\n%s",
+            self.stage_id,
+            self.stage_type,
+            self._in_q is not None,
+            self._out_q is not None,
+            _format_close_trace(),
+        )
         if self._in_q is not None:
             try:
                 self._in_q.put_nowait(SHUTDOWN_TASK)
