@@ -15,12 +15,15 @@ import pytest
 import torch
 from PIL import Image
 from transformers import AutoTokenizer
+from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.diffusion]
+
+logger = init_logger(__name__)
 
 _SYSTEM_PROMPT = (
     "Describe the image by detailing the color, shape, size, texture, quantity, text, "
@@ -229,19 +232,36 @@ async def _run_request(
     out_root: Path,
     is_remote: bool = False,
 ) -> tuple[OmniRequestOutput, dict[str, Any]]:
+    logger.info(
+        "[MigrationTrace] Starting request request_id=%s req_index=%s is_remote=%s out_root=%s",
+        request_id,
+        req_index,
+        is_remote,
+        out_root,
+    )
     final_output: OmniRequestOutput | None = None
-    async for out in omni.generate(
-        prompt={
-            "prompt_ids": prompt_ids,
-            "prompt_mask": prompt_mask,
-            "negative_prompt_ids": negative_prompt_ids,
-            "negative_prompt_mask": negative_prompt_mask,
-        },
-        request_id=request_id,
-        sampling_params_list=[sampling_params],
-        is_remote=is_remote,
-    ):
-        final_output = out
+    try:
+        async for out in omni.generate(
+            prompt={
+                "prompt_ids": prompt_ids,
+                "prompt_mask": prompt_mask,
+                "negative_prompt_ids": negative_prompt_ids,
+                "negative_prompt_mask": negative_prompt_mask,
+            },
+            request_id=request_id,
+            sampling_params_list=[sampling_params],
+            is_remote=is_remote,
+        ):
+            logger.info(
+                "[MigrationTrace] Streaming output request_id=%s finished=%s stage_id=%s",
+                request_id,
+                getattr(out, "finished", None),
+                getattr(out, "stage_id", None),
+            )
+            final_output = out
+    except Exception:
+        logger.exception("[MigrationTrace] Request failed request_id=%s is_remote=%s", request_id, is_remote)
+        raise
     if final_output is None:
         raise RuntimeError(f"No final output for request_id={request_id}")
     payload = _write_request_result(
@@ -251,6 +271,12 @@ async def _run_request(
         prompt_ids=prompt_ids,
         negative_prompt_ids=negative_prompt_ids,
         output=final_output,
+    )
+    logger.info(
+        "[MigrationTrace] Completed request request_id=%s req_index=%s is_remote=%s",
+        request_id,
+        req_index,
+        is_remote,
     )
     return final_output, payload
 
@@ -291,6 +317,7 @@ async def _run_migration(tmp_path: Path) -> None:
     try:
         req0_id = "migration-req-0"
         req1_id = "migration-req-1"
+        logger.info("[MigrationTrace] Created AsyncOmni instances; launching local requests")
 
         task0 = asyncio.create_task(
             _run_request(
@@ -321,10 +348,21 @@ async def _run_migration(tmp_path: Path) -> None:
             )
         )
 
+        logger.info("[MigrationTrace] Sleeping before pause request_id=%s", req0_id)
         await asyncio.sleep(3)
+        logger.info("[MigrationTrace] Calling pause for request_id=%s", req0_id)
         await omni0.pause([req0_id])
-        paused_output, paused_payload = await task0
+        logger.info("[MigrationTrace] Pause returned for request_id=%s", req0_id)
 
+        logger.info("[MigrationTrace] Awaiting paused task request_id=%s", req0_id)
+        paused_output, paused_payload = await task0
+        logger.info(
+            "[MigrationTrace] Paused task completed request_id=%s output_request_id=%s",
+            req0_id,
+            paused_output.request_id,
+        )
+
+        logger.info("[MigrationTrace] Launching remote replay request_id=%s", req0_id)
         remote_task = asyncio.create_task(
             _run_request(
                 omni1,
@@ -341,8 +379,20 @@ async def _run_migration(tmp_path: Path) -> None:
             )
         )
 
+        logger.info("[MigrationTrace] Awaiting baseline task request_id=%s", req1_id)
         baseline_output, baseline_payload = await task1
+        logger.info(
+            "[MigrationTrace] Baseline task completed request_id=%s output_request_id=%s",
+            req1_id,
+            baseline_output.request_id,
+        )
+        logger.info("[MigrationTrace] Awaiting remote task request_id=%s", req0_id)
         remote_output, remote_payload = await remote_task
+        logger.info(
+            "[MigrationTrace] Remote task completed request_id=%s output_request_id=%s",
+            req0_id,
+            remote_output.request_id,
+        )
 
         normalized_baseline = dict(baseline_payload)
         normalized_remote = dict(remote_payload)
@@ -371,7 +421,11 @@ async def _run_migration(tmp_path: Path) -> None:
             "remote_output_request_id": remote_output.request_id,
         }
         (out_root / "comparison.json").write_text(json.dumps(comparison, ensure_ascii=True), encoding="utf-8")
+    except Exception:
+        logger.exception("[MigrationTrace] Migration flow failed before cleanup")
+        raise
     finally:
+        logger.info("[MigrationTrace] Entering cleanup for migration test")
         omni0.close()
         omni1.close()
 
