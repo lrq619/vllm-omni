@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import copy
+import pickle
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -15,6 +17,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwenimage_step import (
     QwenImagePipelineWithLogProbStep,
 )
+from vllm_omni.diffusion.mooncake_store import MooncakeStore
 from vllm_omni.diffusion.models.qwen_image.tensor_pool import TensorPoolManager
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.stepwise_scheduler import (
@@ -192,6 +195,13 @@ class DiffusionStepwiseWorker(DiffusionWorker):
         self._pool_specs: dict[str, tuple[tuple[int, ...], torch.dtype, torch.device]] = {}
         self._metrics = StepwiseWorkerMetric()
         self._non_empty_loop_counter: int = 0
+        self._mooncake_store: MooncakeStore | None = None
+        self._pause_commit_queue: deque[list[str]] = deque()
+        if od_config.enable_stepwise:
+            if MooncakeStore is None:
+                raise ImportError("MooncakeStore is required when enable_stepwise=True.")
+            self._mooncake_store = MooncakeStore()
+            self._mooncake_store.initialize()
 
     def _pipeline(self) -> QwenImagePipelineWithLogProbStep:
         assert self.model_runner is not None, "Model runner not initialized"
@@ -213,6 +223,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
         self._manager = TensorPoolManager(max_bsz=max_bsz)
         self._states.clear()
         self._pool_specs.clear()
+        self._pause_commit_queue.clear()
         self._metrics.reset()
         self._non_empty_loop_counter = 0
         self._max_bsz = max_bsz
@@ -227,6 +238,161 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             logger.error("Stepwise runtime is not initialized.")
             raise RuntimeError("Stepwise runtime is not initialized.")
         return self._manager
+
+    def _ensure_mooncake_store(self) -> MooncakeStore:
+        if self._mooncake_store is None:
+            logger.error("Mooncake store is not initialized for stepwise worker.")
+            raise RuntimeError("Mooncake store is not initialized for stepwise worker.")
+        return self._mooncake_store
+
+    @staticmethod
+    def _mooncake_key(request_id: str, tensor_name: str) -> str:
+        return f"{request_id}::{tensor_name}"
+
+    @staticmethod
+    def _strip_tensors_for_state(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return None
+        if isinstance(value, dict):
+            return {k: DiffusionStepwiseWorker._strip_tensors_for_state(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [DiffusionStepwiseWorker._strip_tensors_for_state(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(DiffusionStepwiseWorker._strip_tensors_for_state(v) for v in value)
+        return value
+
+    def _build_pause_state_payload(self, state: WorkerRequestState) -> dict[str, Any]:
+        prompt = state.request.prompts[0] if state.request.prompts else {}
+        current_timestep = None
+        if 0 <= state.step_idx < len(state.timesteps):
+            current_timestep = float(state.timesteps[state.step_idx])
+
+        return {
+            "version": 1,
+            "request_id": state.request_id,
+            "row_index": state.row_index,
+            "step_idx": state.step_idx,
+            "max_steps": state.max_steps,
+            "current_timestep": current_timestep,
+            "timesteps": list(state.timesteps),
+            "do_true_cfg": state.do_true_cfg,
+            "true_cfg_scale": state.true_cfg_scale,
+            "noise_level": state.noise_level,
+            "sde_window": tuple(state.sde_window),
+            "sde_type": state.sde_type,
+            "logprobs": state.logprobs,
+            "guidance_scale": state.guidance_scale,
+            "output_type": state.output_type,
+            "height": state.height,
+            "width": state.width,
+            "img_shapes": list(state.img_shapes),
+            "txt_seq_len": state.txt_seq_len,
+            "negative_txt_seq_len": state.negative_txt_seq_len,
+            "prompt": self._strip_tensors_for_state(prompt),
+            "tensor_names": [
+                "prompt_ids",
+                "prompt_mask",
+                "negative_prompt_ids",
+                "negative_prompt_mask",
+            ],
+            "tensor_pool_names": list(self._ensure_runtime().pools.keys()),
+            "collected_latents_count": len(state.collected_latents),
+            "collected_log_probs_count": len(state.collected_log_probs),
+            "collected_timesteps_count": len(state.collected_timesteps),
+        }
+
+    def _load_remote_prompt_payload(
+        self,
+        *,
+        request_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        store = self._ensure_mooncake_store()
+        state_key = self._mooncake_key(request_id, "state")
+        payload = store.get(state_key, device="cpu")
+        if payload is None:
+            raise RuntimeError(f"Missing remote state payload for request_id={request_id}")
+        if not isinstance(payload, (bytes, bytearray, memoryview)):
+            raise RuntimeError(
+                f"Remote state payload for request_id={request_id} must be bytes, got {type(payload).__name__}"
+            )
+        state = pickle.loads(bytes(payload))
+        if not isinstance(state, dict):
+            raise RuntimeError(f"Remote state payload for request_id={request_id} must decode to dict.")
+
+        custom_prompt = state.get("prompt")
+        if custom_prompt is None:
+            custom_prompt = {}
+        if not isinstance(custom_prompt, dict):
+            raise RuntimeError(
+                f"Remote state payload for request_id={request_id} must contain dict prompt payload."
+            )
+
+        tensor_names = state.get("tensor_names", [])
+        if not isinstance(tensor_names, list):
+            raise RuntimeError(
+                f"Remote state payload for request_id={request_id} must contain list tensor_names."
+            )
+
+        loaded_tensors: dict[str, Any] = {}
+        for tensor_name in tensor_names:
+            tensor_key = self._mooncake_key(request_id, str(tensor_name))
+            tensor = store.get(tensor_key, device=self._pipeline().device)
+            if tensor is None:
+                raise RuntimeError(
+                    f"Missing remote tensor '{tensor_name}' for request_id={request_id}"
+                )
+            loaded_tensors[str(tensor_name)] = tensor
+
+        return state, loaded_tensors
+
+    def stepwise_pause_requests(self, request_ids: list[str]) -> dict[str, Any]:
+        if not isinstance(request_ids, list):
+            raise TypeError(f"request_ids must be list[str], got {type(request_ids).__name__}")
+        if not request_ids:
+            return {"queued_request_ids": []}
+
+        missing = [request_id for request_id in request_ids if request_id not in self._states]
+        if missing:
+            raise RuntimeError(f"Pause requested for unknown request_id(s): {missing}")
+
+        self._pause_commit_queue.append(list(request_ids))
+        logger.info("Queued pause commit request_ids=%s", request_ids)
+        return {"queued_request_ids": list(request_ids)}
+
+    def _drain_pause_commit_queue(self) -> list[str]:
+        drained: list[str] = []
+        while self._pause_commit_queue:
+            drained.extend(self._pause_commit_queue.popleft())
+        return drained
+
+    def _commit_paused_requests(self, request_ids: list[str]) -> None:
+        if not request_ids:
+            return
+
+        store = self._ensure_mooncake_store()
+        manager = self._ensure_runtime()
+        pool_names = list(manager.pools.keys())
+
+        for request_id in request_ids:
+            if request_id not in self._states:
+                raise RuntimeError(f"Cannot commit paused request_id={request_id}: state missing")
+
+            state = self._states[request_id]
+            row_index = state.row_index
+
+            payload = self._build_pause_state_payload(state)
+            store.put(self._mooncake_key(request_id, "state"), pickle.dumps(payload))
+
+            for pool_name in pool_names:
+                tensor = manager.get(pool_name, [row_index])
+                store.put(self._mooncake_key(request_id, pool_name), tensor)
+
+            logger.info(
+                "Committed paused request_id=%s row=%d to Mooncake with pools=%s",
+                request_id,
+                row_index,
+                pool_names,
+            )
 
     def _ensure_pool(self, name: str, tensor: torch.Tensor) -> None:
         manager = self._ensure_runtime()
@@ -286,6 +452,18 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 if not isinstance(custom_prompt, dict):
                     logger.error("Stepwise admission expects dict prompt payload for Qwen step runtime.")
                     raise RuntimeError("Stepwise admission expects dict prompt payload for Qwen step runtime.")
+
+                is_remote_request = bool(request.is_remote_list[0]) if request.is_remote_list else False
+                if is_remote_request:
+                    remote_state, loaded_tensors = self._load_remote_prompt_payload(request_id=request_id)
+                    remote_prompt = remote_state.get("prompt", {})
+                    if not isinstance(remote_prompt, dict):
+                        logger.error("Remote state prompt payload must be a dict request_id=%s", request_id)
+                        raise RuntimeError(f"Remote state prompt payload must be a dict request_id={request_id}")
+                    custom_prompt = dict(remote_prompt)
+                    custom_prompt.update(loaded_tensors)
+                    if request.prompts:
+                        request.prompts[0] = custom_prompt
 
                 prompt_ids = custom_prompt.get("prompt_ids")
                 prompt_mask = custom_prompt.get("prompt_mask")
@@ -631,6 +809,17 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                     next_timesteps.append(float(state.timesteps[state.step_idx]))
 
             manager.put("latents", row_indices, torch.cat(next_latents, dim=0))
+            paused_request_ids = self._drain_pause_commit_queue()
+            paused_request_set = set(paused_request_ids)
+            if paused_request_ids:
+                self._commit_paused_requests(paused_request_ids)
+
+            final_finished = [bool(finished[i] or plan.request_ids[i] in paused_request_set) for i in range(len(plan.request_ids))]
+            final_next_timesteps = [
+                None if final_finished[i] else next_timesteps[i]
+                for i in range(len(plan.request_ids))
+            ]
+
             latency_ms = (time.perf_counter() - start_time) * 1000.0
             cuda_allocated_mb, cuda_reserved_mb = _cuda_mem_mb(latents.device)
             loop_end_timestamp_ms = time.time() * 1000.0
@@ -641,7 +830,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 request_ids=plan.request_ids,
                 row_indices=row_indices,
                 step_indices=next_step_indices,
-                finished_count=sum(1 for x in finished if x),
+                finished_count=sum(1 for x in final_finished),
                 latency_ms=latency_ms,
                 cuda_allocated_mb=cuda_allocated_mb,
                 cuda_reserved_mb=cuda_reserved_mb,
@@ -654,8 +843,8 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 request_ids=list(plan.request_ids),
                 row_indices=row_indices,
                 step_indices=next_step_indices,
-                next_timesteps=next_timesteps,
-                finished=finished,
+                next_timesteps=final_next_timesteps,
+                finished=final_finished,
             )
 
     def stepwise_finalize_request(self, request_id: str) -> DiffusionOutput:
@@ -727,4 +916,6 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             raise RuntimeError(f"Deadmit called for unknown request_id={request_id}")
         state = self._states.pop(request_id)
         manager.release([state.row_index])
+        # TODO: Mooncake payload cleanup is intentionally deferred until the
+        # remote request lifecycle is fully validated.
         logger.info("Deadmit complete request_id=%s row=%d", request_id, state.row_index)

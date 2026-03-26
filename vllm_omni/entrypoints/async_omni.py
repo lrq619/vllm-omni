@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import copy
+import pickle
 import time
 import weakref
 from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
@@ -17,6 +18,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.mooncake_store import MooncakeStore
 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length, try_send_via_connector
 from vllm_omni.distributed.ray_utils.utils import try_close_ray
 from vllm_omni.engine.input_processor import OmniInputProcessor
@@ -117,6 +119,7 @@ class AsyncOmni(OmniBase):
         # RPC results storage: {stage_id: {rpc_id: result}}
         # Used to avoid race condition between output_handler and collective_rpc
         self._rpc_results: dict[int, dict[str, dict[str, Any]]] = {}
+        self._mooncake_store: MooncakeStore | None = None
 
         super().__init__(model, **kwargs)
 
@@ -216,6 +219,47 @@ class AsyncOmni(OmniBase):
         default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
         return default_stage_cfg
 
+    def _get_mooncake_store(self) -> MooncakeStore:
+        if self._mooncake_store is None:
+            self._mooncake_store = MooncakeStore()
+            self._mooncake_store.initialize()
+        return self._mooncake_store
+
+    @staticmethod
+    def _strip_tensors_for_state(value):
+        if isinstance(value, torch.Tensor):
+            return None
+        if isinstance(value, dict):
+            return {k: AsyncOmni._strip_tensors_for_state(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [AsyncOmni._strip_tensors_for_state(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(AsyncOmni._strip_tensors_for_state(v) for v in value)
+        return value
+
+    def _store_remote_request_payload(self, *, request_id: str, prompt: OmniPromptType) -> None:
+        if not isinstance(prompt, dict):
+            raise TypeError("Remote diffusion requests currently require dict-based prompts.")
+
+        store = self._get_mooncake_store()
+        remote_prompt = self._strip_tensors_for_state(copy.deepcopy(prompt))
+        tensor_names: list[str] = []
+        for tensor_name in ("prompt_ids", "prompt_mask", "negative_prompt_ids", "negative_prompt_mask"):
+            tensor_value = prompt.get(tensor_name)
+            if tensor_value is None:
+                continue
+            tensor_names.append(tensor_name)
+            tensor = tensor_value if isinstance(tensor_value, torch.Tensor) else torch.as_tensor(tensor_value)
+            store.put(f"{request_id}::{tensor_name}", tensor)
+
+        state_payload = {
+            "version": 1,
+            "request_id": request_id,
+            "tensor_names": tensor_names,
+            "prompt": remote_prompt,
+        }
+        store.put(f"{request_id}::state", pickle.dumps(state_payload))
+
     def _process_stage_ready(self, stage: OmniStage, stage_id: int, result: dict[str, Any]) -> None:
         # Store vllm_config received from worker process (may be None for diffusion stages)
         vllm_config = result.get("vllm_config")
@@ -302,6 +346,7 @@ class AsyncOmni(OmniBase):
         sampling_params_list: Sequence[OmniSamplingParams] | None = None,
         *,
         output_modalities: list[str] | None = None,
+        is_remote: bool = False,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt asynchronously.
 
@@ -344,6 +389,9 @@ class AsyncOmni(OmniBase):
             if len(sampling_params_list) != len(self.stage_list):
                 raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
 
+            if is_remote:
+                self._store_remote_request_payload(request_id=request_id, prompt=prompt)
+
             # Orchestrator keeps stage objects for input derivation
             num_stages = len(self.stage_list)
             # Track per-request start time for end-to-end timing
@@ -372,6 +420,7 @@ class AsyncOmni(OmniBase):
                 "request_id": request_id,
                 "engine_inputs": prompt,
                 "sampling_params": sp0,
+                "is_remote": is_remote,
             }
             self.stage_list[0].submit(task)
             metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
@@ -708,6 +757,47 @@ class AsyncOmni(OmniBase):
             stage.submit(abort_task)
         return None
 
+    def _get_stepwise_diffusion_stages(self) -> list[OmniStage]:
+        stages: list[OmniStage] = []
+        for stage in self.stage_list:
+            if stage.stage_type != "diffusion":
+                continue
+            engine = getattr(stage, "engine", None)
+            od_config = getattr(engine, "od_config", None)
+            if od_config is None or not getattr(od_config, "enable_stepwise", False):
+                continue
+            stages.append(stage)
+        if not stages:
+            raise RuntimeError("pause() requires at least one diffusion stage with enable_stepwise=True.")
+        return stages
+
+    async def pause(self, request_ids: Sequence[str] | str | None = None) -> None:
+        if request_ids is None:
+            request_id_list: list[str] = []
+        elif isinstance(request_ids, str):
+            request_id_list = [request_ids]
+        else:
+            request_id_list = list(request_ids)
+
+        if not request_id_list:
+            return
+
+        self._run_output_handler()
+        stepwise_stages = self._get_stepwise_diffusion_stages()
+        logger.info("[%s] Queuing pause commit for request_ids=%s", self._name, request_id_list)
+        await asyncio.gather(
+            *[
+                asyncio.to_thread(
+                    stage.collective_rpc,
+                    "stepwise_pause_requests",
+                    None,
+                    (request_id_list,),
+                    None,
+                )
+                for stage in stepwise_stages
+            ]
+        )
+
     async def get_vllm_config(self) -> VllmConfig:
         for stage in self.stage_list:
             if stage.is_comprehension:
@@ -917,3 +1007,12 @@ class AsyncOmni(OmniBase):
 
         async with self._pause_cond:
             return self._paused
+
+    def close(self):
+        if self._mooncake_store is not None:
+            try:
+                self._mooncake_store.shutdown()
+            except Exception:
+                pass
+            self._mooncake_store = None
+        return super().close()

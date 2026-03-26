@@ -1045,6 +1045,7 @@ def _stage_worker(
         batch_engine_sampling_params: OmniSamplingParams = batch_tasks[0]["sampling_params"]
 
         batch_request_ids: list[Any] = []
+        batch_is_remote_list: list[bool] = []
         batch_engine_inputs: list[OmniPromptType] = []
         _rx_bytes_by_rid: dict[Any, int] = {}
         _rx_decode_ms_by_rid: dict[Any, float] = {}
@@ -1081,6 +1082,7 @@ def _stage_worker(
             _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
 
             batch_request_ids.append(rid)
+            batch_is_remote_list.append(bool(t.get("is_remote", False)))
 
             if isinstance(ein, (dict, str)):
                 # For diffusion stage-0, ein might be a string prompt directly
@@ -1104,7 +1106,10 @@ def _stage_worker(
                 batch_engine_sampling_params = cast(OmniDiffusionSamplingParams, batch_engine_sampling_params)
                 # Diffusion generate returns results directly, not an iterator
                 diffusion_results = stage_engine.generate(
-                    batch_engine_inputs, batch_engine_sampling_params, batch_request_ids
+                    batch_engine_inputs,
+                    batch_engine_sampling_params,
+                    batch_request_ids,
+                    is_remote_list=batch_is_remote_list,
                 )
                 gen_outputs.extend(diffusion_results)
                 # Assign request_ids if not present

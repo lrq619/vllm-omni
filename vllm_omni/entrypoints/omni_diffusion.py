@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
+import pickle
 import uuid
 from collections.abc import Sequence
 
+import torch
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.mooncake_store import MooncakeStore
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 from vllm_omni.outputs import OmniRequestOutput
@@ -101,29 +105,103 @@ class OmniDiffusion:
             od_config.cfg_kv_collect_func = cfg_kv_collect_func
 
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
+        self._mooncake_store: MooncakeStore | None = None
+
+    def _get_mooncake_store(self) -> MooncakeStore:
+        if MooncakeStore is None:
+            raise ImportError("MooncakeStore is required for remote diffusion requests but is unavailable.")
+        if self._mooncake_store is None:
+            self._mooncake_store = MooncakeStore()
+            self._mooncake_store.initialize()
+        return self._mooncake_store
+
+    @staticmethod
+    def _strip_tensors_for_state(value):
+        if isinstance(value, torch.Tensor):
+            return None
+        if isinstance(value, dict):
+            return {k: OmniDiffusion._strip_tensors_for_state(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [OmniDiffusion._strip_tensors_for_state(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(OmniDiffusion._strip_tensors_for_state(v) for v in value)
+        return value
+
+    def _store_remote_request_payload(
+        self,
+        *,
+        request_id: str,
+        prompt: OmniPromptType,
+    ) -> None:
+        if not isinstance(prompt, dict):
+            raise TypeError("Remote diffusion requests currently require dict-based prompts.")
+
+        store = self._get_mooncake_store()
+        remote_prompt = self._strip_tensors_for_state(copy.deepcopy(prompt))
+        tensor_names: list[str] = []
+        for tensor_name in ("prompt_ids", "prompt_mask", "negative_prompt_ids", "negative_prompt_mask"):
+            tensor_value = prompt.get(tensor_name)
+            if tensor_value is None:
+                continue
+            tensor_names.append(tensor_name)
+            tensor = tensor_value if isinstance(tensor_value, torch.Tensor) else torch.as_tensor(tensor_value)
+            store.put(f"{request_id}::{tensor_name}", tensor)
+
+        state_payload = {
+            "version": 1,
+            "request_id": request_id,
+            "tensor_names": tensor_names,
+            "prompt": remote_prompt,
+        }
+        store.put(f"{request_id}::state", pickle.dumps(state_payload))
 
     def generate(
         self,
         prompts: OmniPromptType | Sequence[OmniPromptType],
         sampling_params: OmniDiffusionSamplingParams,
-        request_ids: list[str] = [],
+        request_ids: list[str] | None = None,
+        is_remote_list: list[bool] | None = None,
     ) -> list[OmniRequestOutput]:
         if isinstance(prompts, (str, dict)):
             prompts = [prompts]
         else:
             prompts = list(prompts)
 
-        # Check if request_id is provided in kwargs
+        request_ids = list(request_ids or [])
         if len(request_ids) < len(prompts):
             request_ids.extend(f"{i + len(request_ids)}_{uuid.uuid4()}" for i in range(len(prompts) - len(request_ids)))
+        elif len(request_ids) > len(prompts):
+            request_ids = request_ids[: len(prompts)]
 
-        request = OmniDiffusionRequest(prompts, sampling_params, request_ids)
+        if is_remote_list is None:
+            is_remote_list = [False for _ in prompts]
+        else:
+            is_remote_list = list(is_remote_list)
+            if len(is_remote_list) != len(prompts):
+                raise ValueError(
+                    f"is_remote_list length mismatch: expected {len(prompts)}, got {len(is_remote_list)}"
+                )
+
+        if any(is_remote_list) and not self.od_config.enable_stepwise:
+            raise ValueError("Remote diffusion requests require enable_stepwise=True.")
+
+        for request_id, prompt, is_remote in zip(request_ids, prompts, is_remote_list, strict=True):
+            if is_remote:
+                self._store_remote_request_payload(request_id=request_id, prompt=prompt)
+
+        request = OmniDiffusionRequest(prompts, sampling_params, request_ids=request_ids, is_remote_list=is_remote_list)
         return self._run_engine(request)
 
     def _run_engine(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
         return self.engine.step(request)
 
     def close(self) -> None:
+        if self._mooncake_store is not None:
+            try:
+                self._mooncake_store.shutdown()
+            except Exception:
+                pass
+            self._mooncake_store = None
         self.engine.close()
 
     def __del__(self):  # pragma: no cover - best effort cleanup

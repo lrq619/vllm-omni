@@ -25,9 +25,22 @@ class OmniDiffusionRequest:
     sampling_params: OmniDiffusionSamplingParams
 
     request_ids: list[str] = field(default_factory=list)
+    is_remote_list: list[bool] = field(default_factory=list)
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
+        if self.request_ids and len(self.request_ids) != len(self.prompts):
+            raise ValueError(
+                f"request_ids length mismatch: expected {len(self.prompts)}, got {len(self.request_ids)}"
+            )
+
+        if not self.is_remote_list:
+            self.is_remote_list = [False for _ in self.prompts]
+        elif len(self.is_remote_list) != len(self.prompts):
+            raise ValueError(
+                f"is_remote_list length mismatch: expected {len(self.prompts)}, got {len(self.is_remote_list)}"
+            )
+
         # Set do_classifier_free_guidance based on guidance scale and negative prompt
         if self.sampling_params.guidance_scale > 1.0 and any(
             (not isinstance(p, str) and p.get("negative_prompt")) for p in self.prompts

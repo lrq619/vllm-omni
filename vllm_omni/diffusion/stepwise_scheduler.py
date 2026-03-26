@@ -38,6 +38,7 @@ class RequestRuntimeState:
     step_idx: int
     max_steps: int
     current_timestep: float | None
+    is_remote: bool = False
     finish_reason: str | None = None
     error_message: str | None = None
     result_sink_key: str = ""
@@ -141,6 +142,7 @@ class StepwiseScheduler:
             logger.error("Request is missing request_ids for stepwise runtime.")
             raise ValueError("Stepwise runtime requires request.request_ids[0].")
         request_id = request.request_ids[0]
+        is_remote = bool(request.is_remote_list[0]) if request.is_remote_list else False
         state = RequestRuntimeState(
             request_id=request_id,
             status="pending",
@@ -148,6 +150,7 @@ class StepwiseScheduler:
             step_idx=0,
             max_steps=0,
             current_timestep=None,
+            is_remote=is_remote,
             result_sink_key=request_id,
         )
 
@@ -164,11 +167,14 @@ class StepwiseScheduler:
         state.future.set_result(output)
 
     def _admit_local(self, request: OmniDiffusionRequest, state: RequestRuntimeState) -> AdmissionResult:
+        return self._admit_request(request, state, remote=False)
+
+    def _admit_request(self, request: OmniDiffusionRequest, state: RequestRuntimeState, *, remote: bool) -> AdmissionResult:
         request_id = state.request_id
         if request_id in self._active:
             logger.error("Duplicate active request_id=%s", request_id)
             raise RuntimeError(f"Duplicate active request_id={request_id}")
-        logger.info("Admission start request_id=%s", request_id)
+        logger.info("Admission start request_id=%s remote=%s", request_id, remote)
         result = self._rpc_call(
             "stepwise_admit_request",
             args=(request_id, request),
@@ -187,8 +193,9 @@ class StepwiseScheduler:
             )
             return result
         logger.info(
-            "Admission end request_id=%s rows=%s max_steps=%d first_t=%.6f",
+            "Admission end request_id=%s remote=%s rows=%s max_steps=%d first_t=%.6f",
             request_id,
+            remote,
             result.row_indices,
             result.max_steps,
             result.current_timestep,
@@ -197,8 +204,18 @@ class StepwiseScheduler:
 
     def _admit_remote_unimplemented(self, request: OmniDiffusionRequest) -> AdmissionResult:
         request_id = request.request_ids[0] if request.request_ids else "<missing>"
-        logger.error("Remote admission is not implemented. request_id=%s", request_id)
-        raise NotImplementedError("Remote admission is not implemented for stepwise runtime.")
+        logger.info("Remote admission routed through Mooncake restore request_id=%s", request_id)
+        state = RequestRuntimeState(
+            request_id=request_id,
+            status="pending",
+            row_indices=[],
+            step_idx=0,
+            max_steps=0,
+            current_timestep=None,
+            is_remote=True,
+            result_sink_key=request_id,
+        )
+        return self._admit_request(request, state, remote=True)
 
     def _rpc_call(
         self,
@@ -353,7 +370,7 @@ class StepwiseScheduler:
                             break
                         request, state = self._pending.popleft()
                     try:
-                        admission = self._admit_local(request, state)
+                        admission = self._admit_remote_unimplemented(request) if state.is_remote else self._admit_local(request, state)
                         if not admission.admitted:
                             state.status = "finished"
                             state.finish_reason = "admission_rejected"
