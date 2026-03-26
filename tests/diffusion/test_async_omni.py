@@ -38,7 +38,7 @@ _SYSTEM_PROMPT = (
     "spatial relationships of the objects and background:"
 )
 _SIMPLE_PROMPTS = [
-    "A red apple on a wooden table.",
+    "A green apple on a wooden table.",
     "A blue bird flying over a lake.",
     "A small house in a green field.",
     "A white cat sitting by a window.",
@@ -243,14 +243,14 @@ async def _run_workload_and_dump(
             prompt_ids, prompt_mask = _chat_template_to_ids(tokenizer, prompt_messages)
             negative_prompt_ids, negative_prompt_mask = _chat_template_to_ids(tokenizer, negative_prompt_messages)
             sampling_params = OmniDiffusionSamplingParams(
-                num_inference_steps=10,
+                num_inference_steps=50,
                 # guidance_scale=1.0,
                 true_cfg_scale=4.0,
                 width=512,
                 height=512,
                 output_type="pil",
                 seed=42,
-                max_sequence_length=_APPLY_CHAT_TEMPLATE_KWARGS["max_length"],
+                # max_sequence_length=_APPLY_CHAT_TEMPLATE_KWARGS["max_length"],
                 extra_args={"noise_level": 1, "sde_type": "sde", "logprobs": True, "sde_window_size": 2, "sde_window_range": [0,5]},
             )
             request_id = f"gpu-async-{'step' if enable_stepwise else 'non-step'}-{i:02d}"
@@ -360,12 +360,12 @@ def _ensure_results_exist(max_num_requests: int | None = None) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
 def test_stepwise():
-    asyncio.run(_run_workload_and_dump(enable_stepwise=True, out_root=_STEP_DIR, max_num_requests=1))
+    asyncio.run(_run_workload_and_dump(enable_stepwise=True, out_root=_STEP_DIR))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
 def test_non_stepwise():
-    asyncio.run(_run_workload_and_dump(enable_stepwise=False, out_root=_NON_STEP_DIR, max_num_requests=1))
+    asyncio.run(_run_workload_and_dump(enable_stepwise=False, out_root=_NON_STEP_DIR))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
