@@ -68,7 +68,7 @@ class MooncakeStore:
             status = self.storage_client.setup(
                 self.node_addr,
                 f"http://{self.storage_host}:{self.storage_port}/metadata",
-                0,
+                34359738368,
                 self.local_buffer_size,
                 self.protocol,
                 "",
