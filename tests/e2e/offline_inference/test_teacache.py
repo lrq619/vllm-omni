@@ -10,6 +10,7 @@ It uses minimal settings to keep test time short for CI.
 
 import asyncio
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -32,7 +33,7 @@ if str(REPO_ROOT) not in sys.path:
 from vllm_omni import AsyncOmni, Omni
 from vllm_omni.outputs import OmniRequestOutput
 
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
+os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 _MODEL_ENV_VAR = "VLLM_OMNI_STEPWISE_TEST_MODEL"
 _TOKENIZER_MAX_LENGTH = 1024
@@ -49,6 +50,7 @@ _SYSTEM_PROMPT = (
 _PROMPT_TEXT = "A green apple on a wooden table."
 _NEG_PROMPT_TEXT = " "
 _TEACACHE_OUTPUT_DIR = Path("output/teacache_custom_pipeline")
+_TEACACHE_REL_L1_THRESH_SWEEP = [0.05, 0.1, 0.2, 0.4, 1.0]
 
 
 def _get_model_name_from_env() -> str:
@@ -148,14 +150,26 @@ def _extract_output_image(output: OmniRequestOutput) -> Image.Image:
     raise RuntimeError("No image/tensor found in AsyncOmni output.images.")
 
 
-def _save_teacache_image(final_output: OmniRequestOutput) -> Path:
+def _prepare_teacache_output_dir() -> None:
     if _TEACACHE_OUTPUT_DIR.exists():
         shutil.rmtree(_TEACACHE_OUTPUT_DIR)
     _TEACACHE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _save_teacache_image(final_output: OmniRequestOutput, rel_l1_thresh: float) -> Path:
+    _TEACACHE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     image = _extract_output_image(final_output)
-    image_path = _TEACACHE_OUTPUT_DIR / "output.png"
+    thresh_tag = f"{rel_l1_thresh:g}".replace(".", "p").replace("-", "m")
+    image_path = _TEACACHE_OUTPUT_DIR / f"rel_l1_thresh_{thresh_tag}.png"
     image.save(image_path)
     return image_path
+
+
+def _extract_skip_stats(log_text: str) -> tuple[int, int]:
+    # Count unique denoise steps that were skipped at least once.
+    skip_step_matches = re.findall(r"TEACACHE_STEP_SKIPPED .*step_idx=(\d+)", log_text)
+    unique_skipped_steps = {int(step_idx) for step_idx in skip_step_matches}
+    return len(unique_skipped_steps), len(skip_step_matches)
 
 
 @pytest.mark.core_model
@@ -219,7 +233,7 @@ def test_teacache():
             m.close()
 
 
-async def _run_async_teacache_custom_pipeline(model_name: str) -> OmniRequestOutput:
+async def _run_async_teacache_custom_pipeline(model_name: str, rel_l1_thresh: float) -> OmniRequestOutput:
     tokenizer = _load_tokenizer_from_model(model_name)
     prompt_messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
@@ -238,10 +252,8 @@ async def _run_async_teacache_custom_pipeline(model_name: str) -> OmniRequestOut
         "negative_prompt_mask": negative_prompt_mask,
     }
 
-    # Use a very large threshold to force cache reuse after the first step.
-    # This makes skipped-step behavior deterministic for the logging assertion.
     cache_config = {
-        "rel_l1_thresh": 1e6,
+        "rel_l1_thresh": rel_l1_thresh,
     }
 
     sampling_params = _make_sampling_params()
@@ -263,7 +275,7 @@ async def _run_async_teacache_custom_pipeline(model_name: str) -> OmniRequestOut
 
         async for out in omni.generate(
             prompt=prompt,
-            request_id="async-teacache-custom-pipeline",
+            request_id=f"async-teacache-custom-pipeline-{rel_l1_thresh:g}",
             sampling_params_list=[sampling_params],
         ):
             final_output = out
@@ -286,35 +298,60 @@ async def _run_async_teacache_custom_pipeline(model_name: str) -> OmniRequestOut
 def test_async_teacache_custom_pipeline_logs_skipped_steps(
     capfd: pytest.CaptureFixture[str],
 ):
-    """Test TeaCache skip-step logging with AsyncOmni + custom non-step Qwen pipeline."""
+    """Sweep TeaCache threshold, summarize skipped steps, and save one image per threshold."""
     model_name = _get_model_name_from_env()
-    final_output = asyncio.run(_run_async_teacache_custom_pipeline(model_name))
+    sampling_params = _make_sampling_params()
+    total_steps = int(sampling_params.num_inference_steps)
+    _prepare_teacache_output_dir()
 
-    if not hasattr(final_output, "final_output_type"):
-        raise TypeError(
-            "AsyncOmni final output is missing attribute 'final_output_type'. "
-            f"Got type={type(final_output)!r}."
+    records: list[dict[str, Any]] = []
+    for rel_l1_thresh in _TEACACHE_REL_L1_THRESH_SWEEP:
+        # Clear captured output from previous run before collecting this run's logs.
+        capfd.readouterr()
+        final_output = asyncio.run(_run_async_teacache_custom_pipeline(model_name, rel_l1_thresh=rel_l1_thresh))
+
+        if not hasattr(final_output, "final_output_type"):
+            raise TypeError(
+                "AsyncOmni final output is missing attribute 'final_output_type'. "
+                f"Got type={type(final_output)!r}."
+            )
+        assert final_output.final_output_type == "image", (
+            "Expected final_output_type='image' in AsyncOmni custom pipeline TeaCache test, "
+            f"got {final_output.final_output_type!r}."
         )
-    assert final_output.final_output_type == "image", (
-        "Expected final_output_type='image' in AsyncOmni custom pipeline TeaCache test, "
-        f"got {final_output.final_output_type!r}."
-    )
 
-    try:
-        _extract_output_image(final_output)
-    except Exception as e:
-        raise AssertionError(
-            "AsyncOmni custom pipeline TeaCache test produced no extractable image output."
-        ) from e
+        try:
+            _extract_output_image(final_output)
+        except Exception as e:
+            raise AssertionError(
+                f"AsyncOmni custom pipeline TeaCache test produced no extractable image output "
+                f"for rel_l1_thresh={rel_l1_thresh}."
+            ) from e
 
-    captured = capfd.readouterr()
-    combined_logs = f"{captured.out}\n{captured.err}"
-    assert "TEACACHE_STEP_SKIPPED" in combined_logs, (
-        "TeaCache skip-step log not found. Expected log marker 'TEACACHE_STEP_SKIPPED' "
-        "from custom pipeline AsyncOmni generation."
-    )
+        captured = capfd.readouterr()
+        combined_logs = f"{captured.out}\n{captured.err}"
+        skipped_steps, skip_events = _extract_skip_stats(combined_logs)
+        image_path = _save_teacache_image(final_output, rel_l1_thresh=rel_l1_thresh)
+        if not image_path.exists():
+            raise AssertionError(
+                f"TeaCache output image was not saved to expected path: {image_path}."
+            )
 
-    image_path = _save_teacache_image(final_output)
-    assert image_path.exists(), (
-        f"TeaCache output image was not saved to expected path: {image_path}."
-    )
+        records.append(
+            {
+                "rel_l1_thresh": rel_l1_thresh,
+                "total_steps": total_steps,
+                "skipped_steps": skipped_steps,
+                "skip_events": skip_events,
+                "image_path": str(image_path),
+            }
+        )
+
+    print("\nTeaCache sweep summary")
+    print("| rel_l1_thresh | total_steps | skipped_steps | skip_events | image_path |")
+    print("|---:|---:|---:|---:|---|")
+    for record in records:
+        print(
+            f"| {record['rel_l1_thresh']:.2f} | {record['total_steps']} | "
+            f"{record['skipped_steps']} | {record['skip_events']} | {record['image_path']} |"
+        )
