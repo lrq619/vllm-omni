@@ -10,7 +10,6 @@ It uses minimal settings to keep test time short for CI.
 
 import asyncio
 import os
-import re
 import shutil
 import sys
 from pathlib import Path
@@ -165,11 +164,20 @@ def _save_teacache_image(final_output: OmniRequestOutput, rel_l1_thresh: float) 
     return image_path
 
 
-def _extract_skip_stats(log_text: str) -> tuple[int, int]:
-    # Count unique denoise steps that were skipped at least once.
-    skip_step_matches = re.findall(r"TEACACHE_STEP_SKIPPED .*step_idx=(\d+)", log_text)
-    unique_skipped_steps = {int(step_idx) for step_idx in skip_step_matches}
-    return len(unique_skipped_steps), len(skip_step_matches)
+def _extract_teacache_metrics(final_output: OmniRequestOutput) -> dict[str, Any]:
+    custom_output = getattr(final_output, "custom_output", None)
+    if not isinstance(custom_output, dict):
+        raise TypeError(
+            "AsyncOmni custom pipeline output must provide dict-like custom_output to read TeaCache metrics."
+        )
+
+    metrics = custom_output.get("teacache_metrics")
+    if not isinstance(metrics, dict):
+        raise TypeError(
+            "Missing `teacache_metrics` in custom_output. "
+            "Expected custom_output['teacache_metrics'] to be a dict."
+        )
+    return metrics
 
 
 @pytest.mark.core_model
@@ -328,9 +336,28 @@ def test_async_teacache_custom_pipeline_logs_skipped_steps(
                 f"for rel_l1_thresh={rel_l1_thresh}."
             ) from e
 
-        captured = capfd.readouterr()
-        combined_logs = f"{captured.out}\n{captured.err}"
-        skipped_steps, skip_events = _extract_skip_stats(combined_logs)
+        metrics = _extract_teacache_metrics(final_output)
+        executed_steps = int(metrics.get("denoise_executed_steps", -1))
+        fully_skipped_steps = int(metrics.get("denoise_fully_skipped_steps", -1))
+        skip_events = int(metrics.get("transformer_skipped_calls", -1))
+        skipped_in_sde_window = int(metrics.get("transformer_skipped_calls_in_sde_window", -1))
+        if skipped_in_sde_window != 0:
+            raise AssertionError(
+                "TeaCache skipped transformer calls inside sde_window, but this path requires strict no-skip. "
+                f"rel_l1_thresh={rel_l1_thresh}, skipped_in_sde_window={skipped_in_sde_window}, "
+                f"sde_window={metrics.get('sde_window')}"
+            )
+        if executed_steps <= 0 or executed_steps > total_steps:
+            raise AssertionError(
+                "Invalid `denoise_executed_steps` in teacache_metrics. "
+                f"expected range [1, {total_steps}], got {executed_steps}."
+            )
+        if fully_skipped_steps < 0 or fully_skipped_steps > total_steps:
+            raise AssertionError(
+                "Invalid `denoise_fully_skipped_steps` in teacache_metrics. "
+                f"expected range [0, {total_steps}], got {fully_skipped_steps}."
+            )
+
         image_path = _save_teacache_image(final_output, rel_l1_thresh=rel_l1_thresh)
         if not image_path.exists():
             raise AssertionError(
@@ -341,17 +368,20 @@ def test_async_teacache_custom_pipeline_logs_skipped_steps(
             {
                 "rel_l1_thresh": rel_l1_thresh,
                 "total_steps": total_steps,
-                "skipped_steps": skipped_steps,
+                "executed_steps": executed_steps,
+                "skipped_steps": fully_skipped_steps,
                 "skip_events": skip_events,
+                "skipped_in_sde_window": skipped_in_sde_window,
                 "image_path": str(image_path),
             }
         )
 
     print("\nTeaCache sweep summary")
-    print("| rel_l1_thresh | total_steps | skipped_steps | skip_events | image_path |")
-    print("|---:|---:|---:|---:|---|")
+    print("| rel_l1_thresh | total_steps | executed_steps | fully_skipped_steps | skip_events | skipped_in_sde_window | image_path |")
+    print("|---:|---:|---:|---:|---:|---:|---|")
     for record in records:
         print(
             f"| {record['rel_l1_thresh']:.2f} | {record['total_steps']} | "
-            f"{record['skipped_steps']} | {record['skip_events']} | {record['image_path']} |"
+            f"{record['executed_steps']} | {record['skipped_steps']} | {record['skip_events']} | "
+            f"{record['skipped_in_sde_window']} | {record['image_path']} |"
         )

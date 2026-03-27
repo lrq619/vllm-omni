@@ -67,6 +67,140 @@ class TeaCacheHook(ModelHook):
         self.state_manager = StateManager(TeaCacheState)
         self.extractor_fn = None
         self._forward_cnt = 0
+        self._total_transformer_calls = 0
+        self._executed_transformer_calls = 0
+        self._skipped_transformer_calls = 0
+        self._forced_compute_transformer_calls = 0
+        self._skipped_transformer_calls_in_sde_window = 0
+        self._seen_denoise_steps: set[int] = set()
+        self._executed_denoise_steps: set[int] = set()
+        self._skipped_denoise_steps: set[int] = set()
+        self._forced_compute_denoise_steps_in_sde_window: set[int] = set()
+        self._skipped_denoise_steps_in_sde_window: set[int] = set()
+        self._num_denoise_steps_hint: int | None = None
+
+    def _parse_step_metadata(
+        self, kwargs: dict[str, Any]
+    ) -> tuple[int | None, tuple[int, int] | None, bool]:
+        step_index = kwargs.get("teacache_step_index")
+        sde_window = kwargs.get("teacache_sde_window")
+        force_no_skip_in_sde_window = bool(kwargs.get("teacache_no_skip_in_sde_window", False))
+        num_denoise_steps = kwargs.get("teacache_num_denoise_steps")
+
+        if step_index is not None:
+            if not isinstance(step_index, int):
+                logger.error("Invalid `teacache_step_index` type: expected int, got %s", type(step_index).__name__)
+                raise TypeError(
+                    f"Invalid `teacache_step_index`: expected int, got {type(step_index).__name__}."
+                )
+            if step_index < 0:
+                logger.error("Invalid `teacache_step_index` value: expected >= 0, got %d", step_index)
+                raise ValueError(f"Invalid `teacache_step_index`: expected >= 0, got {step_index}.")
+
+        if num_denoise_steps is not None:
+            if not isinstance(num_denoise_steps, int):
+                logger.error(
+                    "Invalid `teacache_num_denoise_steps` type: expected int, got %s",
+                    type(num_denoise_steps).__name__,
+                )
+                raise TypeError(
+                    f"Invalid `teacache_num_denoise_steps`: expected int, got {type(num_denoise_steps).__name__}."
+                )
+            if num_denoise_steps <= 0:
+                logger.error(
+                    "Invalid `teacache_num_denoise_steps` value: expected > 0, got %d",
+                    num_denoise_steps,
+                )
+                raise ValueError(
+                    f"Invalid `teacache_num_denoise_steps`: expected > 0, got {num_denoise_steps}."
+                )
+            if self._num_denoise_steps_hint is None:
+                self._num_denoise_steps_hint = num_denoise_steps
+            elif self._num_denoise_steps_hint != num_denoise_steps:
+                logger.error(
+                    "Inconsistent `teacache_num_denoise_steps`: previous=%d current=%d",
+                    self._num_denoise_steps_hint,
+                    num_denoise_steps,
+                )
+                raise ValueError(
+                    "Inconsistent `teacache_num_denoise_steps` detected in one generation request: "
+                    f"{self._num_denoise_steps_hint} vs {num_denoise_steps}."
+                )
+            if step_index is not None and step_index >= num_denoise_steps:
+                logger.error(
+                    "`teacache_step_index` out of range: step=%d num_denoise_steps=%d",
+                    step_index,
+                    num_denoise_steps,
+                )
+                raise ValueError(
+                    f"Invalid `teacache_step_index`={step_index}: out of range for "
+                    f"`teacache_num_denoise_steps`={num_denoise_steps}."
+                )
+
+        normalized_window = None
+        if sde_window is not None:
+            if not isinstance(sde_window, (tuple, list)) or len(sde_window) != 2:
+                logger.error(
+                    "Invalid `teacache_sde_window`: expected tuple/list of length 2, got %r",
+                    sde_window,
+                )
+                raise TypeError(
+                    "Invalid `teacache_sde_window`: expected tuple/list of length 2, "
+                    f"got {sde_window!r}."
+                )
+            start, end = sde_window
+            if not isinstance(start, int) or not isinstance(end, int):
+                logger.error(
+                    "Invalid `teacache_sde_window` element types: start=%s end=%s",
+                    type(start).__name__,
+                    type(end).__name__,
+                )
+                raise TypeError(
+                    "Invalid `teacache_sde_window`: both start and end must be int, "
+                    f"got {type(start).__name__} and {type(end).__name__}."
+                )
+            if start < 0 or end < start:
+                logger.error(
+                    "Invalid `teacache_sde_window` bounds: expected start>=0 and end>=start, got (%d, %d)",
+                    start,
+                    end,
+                )
+                raise ValueError(
+                    f"Invalid `teacache_sde_window`: expected start>=0 and end>=start, got ({start}, {end})."
+                )
+            normalized_window = (start, end)
+            if num_denoise_steps is not None and end > num_denoise_steps:
+                logger.error(
+                    "`teacache_sde_window` end out of range: end=%d num_denoise_steps=%d",
+                    end,
+                    num_denoise_steps,
+                )
+                raise ValueError(
+                    f"Invalid `teacache_sde_window` end={end}: exceeds "
+                    f"`teacache_num_denoise_steps`={num_denoise_steps}."
+                )
+
+        if force_no_skip_in_sde_window:
+            if step_index is None:
+                logger.error(
+                    "`teacache_no_skip_in_sde_window=True` requires `teacache_step_index` in transformer kwargs."
+                )
+                raise ValueError(
+                    "Missing `teacache_step_index` while `teacache_no_skip_in_sde_window=True`."
+                )
+            if normalized_window is None:
+                logger.error(
+                    "`teacache_no_skip_in_sde_window=True` requires `teacache_sde_window` in transformer kwargs."
+                )
+                raise ValueError(
+                    "Missing `teacache_sde_window` while `teacache_no_skip_in_sde_window=True`."
+                )
+
+        return step_index, normalized_window, force_no_skip_in_sde_window
+
+    @staticmethod
+    def _in_sde_window(step_index: int, sde_window: tuple[int, int]) -> bool:
+        return sde_window[0] <= step_index < sde_window[1]
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         """
@@ -140,8 +274,28 @@ class TeaCacheHook(ModelHook):
         self.state_manager.set_context(context_name)
         state = self.state_manager.get_state()
 
-        # Decide whether to compute or cache based on modulated input similarity
-        should_compute = self._should_compute_full_transformer(state, ctx.modulated_input)
+        step_index, sde_window, force_no_skip_in_sde_window = self._parse_step_metadata(kwargs)
+        in_sde_window = (
+            step_index is not None
+            and sde_window is not None
+            and self._in_sde_window(step_index, sde_window)
+        )
+
+        # Decide whether to compute or cache based on modulated input similarity.
+        # If requested by caller, SDE-window steps are forced to compute.
+        force_compute = bool(force_no_skip_in_sde_window and in_sde_window)
+        if force_compute:
+            should_compute = True
+        else:
+            should_compute = self._should_compute_full_transformer(state, ctx.modulated_input)
+
+        self._total_transformer_calls += 1
+        if step_index is not None:
+            self._seen_denoise_steps.add(step_index)
+        if force_compute:
+            self._forced_compute_transformer_calls += 1
+            if step_index is not None:
+                self._forced_compute_denoise_steps_in_sde_window.add(step_index)
 
         if not should_compute and state.previous_residual is not None:
             # ============================================================================
@@ -183,6 +337,22 @@ class TeaCacheHook(ModelHook):
                 state.previous_residual_encoder = (ctx.encoder_hidden_states - ori_encoder_hidden_states).detach()
 
             output = ctx.hidden_states
+
+        did_skip = bool(not should_compute and state.previous_residual is not None)
+        if did_skip:
+            state.skip_calls += 1
+            self._skipped_transformer_calls += 1
+            if step_index is not None:
+                self._skipped_denoise_steps.add(step_index)
+            if in_sde_window:
+                self._skipped_transformer_calls_in_sde_window += 1
+                if step_index is not None:
+                    self._skipped_denoise_steps_in_sde_window.add(step_index)
+        else:
+            state.compute_calls += 1
+            self._executed_transformer_calls += 1
+            if step_index is not None:
+                self._executed_denoise_steps.add(step_index)
 
         # Update state
         state.previous_modulated_input = ctx.modulated_input.detach()
@@ -255,7 +425,45 @@ class TeaCacheHook(ModelHook):
         """
         self.state_manager.reset()
         self._forward_cnt = 0
+        self._total_transformer_calls = 0
+        self._executed_transformer_calls = 0
+        self._skipped_transformer_calls = 0
+        self._forced_compute_transformer_calls = 0
+        self._skipped_transformer_calls_in_sde_window = 0
+        self._seen_denoise_steps.clear()
+        self._executed_denoise_steps.clear()
+        self._skipped_denoise_steps.clear()
+        self._forced_compute_denoise_steps_in_sde_window.clear()
+        self._skipped_denoise_steps_in_sde_window.clear()
+        self._num_denoise_steps_hint = None
         return module
+
+    def get_metrics(self) -> dict[str, Any]:
+        seen_steps = set(self._seen_denoise_steps)
+        executed_steps = set(self._executed_denoise_steps)
+        skipped_steps = set(self._skipped_denoise_steps)
+        fully_skipped_steps = seen_steps - executed_steps
+
+        return {
+            "transformer_total_calls": self._total_transformer_calls,
+            "transformer_executed_calls": self._executed_transformer_calls,
+            "transformer_skipped_calls": self._skipped_transformer_calls,
+            "transformer_forced_compute_calls_in_sde_window": self._forced_compute_transformer_calls,
+            "transformer_skipped_calls_in_sde_window": self._skipped_transformer_calls_in_sde_window,
+            "denoise_total_steps_hint": self._num_denoise_steps_hint,
+            "denoise_seen_steps": len(seen_steps),
+            "denoise_executed_steps": len(executed_steps),
+            "denoise_steps_with_any_skip": len(skipped_steps),
+            "denoise_fully_skipped_steps": len(fully_skipped_steps),
+            "denoise_step_indices_seen": sorted(seen_steps),
+            "denoise_step_indices_executed": sorted(executed_steps),
+            "denoise_step_indices_with_any_skip": sorted(skipped_steps),
+            "denoise_step_indices_fully_skipped": sorted(fully_skipped_steps),
+            "denoise_step_indices_forced_compute_in_sde_window": sorted(
+                self._forced_compute_denoise_steps_in_sde_window
+            ),
+            "denoise_step_indices_skipped_in_sde_window": sorted(self._skipped_denoise_steps_in_sde_window),
+        }
 
 
 def apply_teacache_hook(module: torch.nn.Module, config: TeaCacheConfig) -> None:

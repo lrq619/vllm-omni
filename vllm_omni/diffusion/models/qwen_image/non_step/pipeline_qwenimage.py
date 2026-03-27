@@ -17,6 +17,8 @@ from typing import Any, Literal
 import torch
 from diffusers.models.autoencoders.autoencoder_kl_qwenimage import AutoencoderKLQwenImage
 from transformers import Qwen2_5_VLForConditionalGeneration
+from vllm.logger import init_logger
+from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -27,6 +29,8 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.models.qwen_image.non_step.scheduling_flow_match_sde_discrete import FlowMatchSDEDiscreteScheduler
 from vllm_omni.diffusion.models.qwen_image.non_step.qwen_image_transformer import QwenImageTransformer2DModelFixed
+
+logger = init_logger(__name__)
 
 
 # QwenImageTransformer2DModelFixed = QwenImageTransformer2DModelStep
@@ -164,6 +168,8 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
         sde_type,
         generator,
         logprobs,
+        teacache_enabled,
+        no_skip_sde_window_for_teacache,
     ):
 
         all_latents = []
@@ -171,7 +177,6 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
         all_timesteps = []
         self.scheduler.set_begin_index(0)
         for i, t in enumerate(timesteps):
-            prefix = f"diffuse.step.{i}"
             if self.interrupt:
                 continue
 
@@ -192,7 +197,7 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
 
             # Forward pass for positive prompt (or unconditional if no CFG)
             self.transformer.do_true_cfg = do_true_cfg
-            noise_pred = self.transformer(
+            transformer_kwargs = dict(
                 hidden_states=latents,
                 timestep=timestep / 1000,
                 guidance=guidance,
@@ -202,10 +207,16 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
                 txt_seq_lens=txt_seq_lens,
                 attention_kwargs=self.attention_kwargs,
                 return_dict=False,
-            )[0]
+            )
+            if teacache_enabled:
+                transformer_kwargs["teacache_step_index"] = i
+                transformer_kwargs["teacache_sde_window"] = sde_window
+                transformer_kwargs["teacache_num_denoise_steps"] = len(timesteps)
+                transformer_kwargs["teacache_no_skip_in_sde_window"] = no_skip_sde_window_for_teacache
+            noise_pred = self.transformer(**transformer_kwargs)[0]
             # Forward pass for negative prompt (CFG)
             if do_true_cfg:
-                neg_noise_pred = self.transformer(
+                neg_transformer_kwargs = dict(
                     hidden_states=latents,
                     timestep=timestep / 1000,
                     guidance=guidance,
@@ -215,7 +226,13 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
                     txt_seq_lens=negative_txt_seq_lens,
                     attention_kwargs=self.attention_kwargs,
                     return_dict=False,
-                )[0]
+                )
+                if teacache_enabled:
+                    neg_transformer_kwargs["teacache_step_index"] = i
+                    neg_transformer_kwargs["teacache_sde_window"] = sde_window
+                    neg_transformer_kwargs["teacache_num_denoise_steps"] = len(timesteps)
+                    neg_transformer_kwargs["teacache_no_skip_in_sde_window"] = no_skip_sde_window_for_teacache
+                neg_noise_pred = self.transformer(**neg_transformer_kwargs)[0]
                 comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
 
                 cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
@@ -254,6 +271,43 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
         all_timesteps = torch.stack(all_timesteps).unsqueeze(0).expand(latents.shape[0], -1)
 
         return latents, all_latents, all_log_probs, all_timesteps
+
+    def _resolve_teacache_hook(self) -> TeaCacheHook | None:
+        if self.od_config.cache_backend != "tea_cache":
+            return None
+
+        hook_registry = getattr(self.transformer, "_hook_registry", None)
+        if hook_registry is None:
+            logger.error(
+                "TeaCache is configured but transformer has no hook registry. "
+                "Expected TeaCacheHook to be registered before pipeline.forward."
+            )
+            raise RuntimeError(
+                "TeaCache is configured but transformer hook registry is missing. "
+                "Please ensure cache_backend='tea_cache' is initialized correctly."
+            )
+
+        hook = hook_registry.get_hook(TeaCacheHook._HOOK_NAME)
+        if hook is None:
+            logger.error(
+                "TeaCache is configured but TeaCacheHook '%s' is not registered on transformer.",
+                TeaCacheHook._HOOK_NAME,
+            )
+            raise RuntimeError(
+                "TeaCache is configured but TeaCacheHook is not registered on transformer. "
+                "Please ensure cache backend initialization completed successfully."
+            )
+        if not isinstance(hook, TeaCacheHook):
+            logger.error(
+                "Unexpected hook type for '%s': expected TeaCacheHook, got %s.",
+                TeaCacheHook._HOOK_NAME,
+                type(hook).__name__,
+            )
+            raise TypeError(
+                f"Invalid hook type for '{TeaCacheHook._HOOK_NAME}': expected TeaCacheHook, got {type(hook).__name__}."
+            )
+
+        return hook
 
     def forward(
         self,
@@ -307,6 +361,7 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
         sde_window_range = sp.extra_args.get("sde_window_range", None) or sde_window_range
         sde_type = sp.extra_args.get("sde_type", None) or sde_type
         logprobs = sp.extra_args.get("logprobs", logprobs)
+        no_skip_sde_window_for_teacache = bool(sp.extra_args.get("teacache_no_skip_in_sde_window", True))
 
         generator = sp.generator or generator
         if generator is None and sp.seed is not None:
@@ -331,7 +386,7 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
             batch_size = prompt_embeds.shape[0]
         else:
             # Both prompt_ids and prompt_embeds are None (e.g. during warmup/dummy run).
-            # Return a minimal dummy output to avoid crashing.
+            # Keep existing behavior and return a minimal dummy output.
             return DiffusionOutput(output=None, custom_output={})
 
         if isinstance(negative_prompt_ids, list):
@@ -405,6 +460,9 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
         else:
             sde_window = (0, len(timesteps) - 1)
 
+        teacache_hook = self._resolve_teacache_hook()
+        teacache_enabled = teacache_hook is not None
+
         latents, all_latents, all_log_probs, all_timesteps = self.diffuse(
             prompt_embeds,
             prompt_embeds_mask,
@@ -423,6 +481,8 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
             sde_type,
             generator,
             logprobs,
+            teacache_enabled,
+            no_skip_sde_window_for_teacache,
         )
 
         self._current_timestep = None
@@ -442,16 +502,23 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
             latents = latents / latents_std + latents_mean
             image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
 
+        custom_output = {
+            "responses": _maybe_to_cpu(image),
+            "all_latents": _maybe_to_cpu(all_latents),
+            "rollout_log_probs": _maybe_to_cpu(all_log_probs),
+            "all_timesteps": _maybe_to_cpu(all_timesteps),
+            "prompt_embeds": _maybe_to_cpu(prompt_embeds),
+            "prompt_embeds_mask": _maybe_to_cpu(prompt_embeds_mask),
+            "negative_prompt_embeds": _maybe_to_cpu(negative_prompt_embeds),
+            "negative_prompt_embeds_mask": _maybe_to_cpu(negative_prompt_embeds_mask),
+        }
+        if teacache_hook is not None:
+            teacache_metrics = teacache_hook.get_metrics()
+            teacache_metrics["sde_window"] = [int(sde_window[0]), int(sde_window[1])]
+            teacache_metrics["teacache_no_skip_in_sde_window"] = no_skip_sde_window_for_teacache
+            custom_output["teacache_metrics"] = teacache_metrics
+
         return DiffusionOutput(
             output=_maybe_to_cpu(image),
-            custom_output={
-                "responses": _maybe_to_cpu(image),
-                "all_latents": _maybe_to_cpu(all_latents),
-                "rollout_log_probs": _maybe_to_cpu(all_log_probs),
-                "all_timesteps": _maybe_to_cpu(all_timesteps),
-                "prompt_embeds": _maybe_to_cpu(prompt_embeds),
-                "prompt_embeds_mask": _maybe_to_cpu(prompt_embeds_mask),
-                "negative_prompt_embeds": _maybe_to_cpu(negative_prompt_embeds),
-                "negative_prompt_embeds_mask": _maybe_to_cpu(negative_prompt_embeds_mask),
-            },
+            custom_output=custom_output,
         )

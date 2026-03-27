@@ -29,6 +29,10 @@ class TeaCacheState:
         self.previous_residual: torch.Tensor | None = None
         self.previous_residual_encoder: torch.Tensor | None = None
 
+        # Structured metrics
+        self.compute_calls = 0
+        self.skip_calls = 0
+
     def reset(self) -> None:
         """Reset all state variables for a new inference run."""
         self.cnt = 0
@@ -36,3 +40,5 @@ class TeaCacheState:
         self.previous_modulated_input = None
         self.previous_residual = None
         self.previous_residual_encoder = None
+        self.compute_calls = 0
+        self.skip_calls = 0
