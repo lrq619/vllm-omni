@@ -64,11 +64,11 @@ def _weak_close_cleanup_async(async_omni_ref: "weakref.ReferenceType[AsyncOmni]"
     zmq_ctx = getattr(async_omni, "_zmq_ctx", None)
 
     logger.warning(
-        "[CloseTrace] _weak_close_cleanup_async invoked stage_count=%d in_queue_count=%d out_queue_count=%d\n%s",
+        "[CloseTrace] _weak_close_cleanup_async invoked stage_count=%d in_queue_count=%d out_queue_count=%d",
         len(stage_list) if stage_list is not None else -1,
         len(stage_in_queues) if stage_in_queues is not None else -1,
         len(stage_out_queues) if stage_out_queues is not None else -1,
-        _format_close_trace(),
+        # _format_close_trace(),  # Disabled: close-stack trace is too noisy in normal shutdown.
     )
     async_omni._closing = True
 
@@ -355,7 +355,7 @@ class AsyncOmni(OmniBase):
         Alias for close() method. Cleans up all stage processes
         and inter-process communication resources.
         """
-        logger.warning("[CloseTrace] AsyncOmni.shutdown invoked\n%s", _format_close_trace())
+        logger.warning("[CloseTrace] AsyncOmni.shutdown invoked")
         if hasattr(self, "_weak_finalizer"):
             self._weak_finalizer()
 
@@ -1041,7 +1041,7 @@ class AsyncOmni(OmniBase):
     def close(self):
         if self._closed:
             return None
-        logger.warning("[CloseTrace] AsyncOmni.close invoked\n%s", _format_close_trace())
+        logger.warning("[CloseTrace] AsyncOmni.close invoked")
         self._closing = True
         if self.output_handler is not None:
             self.output_handler.cancel()

@@ -41,11 +41,18 @@ class MooncakeStore:
         self.protocol = protocol or os.environ.get("MOONCAKE_PROTOCOL", "tcp")
         self.node_addr = node_addr or os.environ.get("MOONCAKE_NODE_ADDR", _get_hostname_ip())
         self.local_buffer_size = local_buffer_size
+        self.segment_size_gb = int(os.environ.get("MOONCAKE_SEGMENT_SIZE_GB", "32"))
+        if self.segment_size_gb <= 0:
+            raise ValueError(
+                f"Invalid MOONCAKE_SEGMENT_SIZE_GB={self.segment_size_gb}; expected a positive integer."
+            )
+        self.segment_size_bytes = self.segment_size_gb * (1024**3)
         self.initialized = False
         self.storage_client = None
         self._cached_keys: Dict[str, dict[str, Any]] = {}
         logger.info(
-            "MooncakeStore initialized with storage=%s:%s master=%s:%s protocol=%s node=%s local_buffer_size=%s",
+            "MooncakeStore initialized with storage=%s:%s master=%s:%s protocol=%s node=%s "
+            "local_buffer_size=%s segment_size_gb=%s segment_size_bytes=%s",
             self.storage_host,
             self.storage_port,
             self.master_host,
@@ -53,6 +60,8 @@ class MooncakeStore:
             self.protocol,
             self.node_addr,
             self.local_buffer_size,
+            self.segment_size_gb,
+            self.segment_size_bytes,
         )
 
     def initialize(self, max_retries: int = 10, retry_delay: float = 2.0) -> None:
@@ -68,7 +77,7 @@ class MooncakeStore:
             status = self.storage_client.setup(
                 self.node_addr,
                 f"http://{self.storage_host}:{self.storage_port}/metadata",
-                34359738368,
+                self.segment_size_bytes,
                 self.local_buffer_size,
                 self.protocol,
                 "",
