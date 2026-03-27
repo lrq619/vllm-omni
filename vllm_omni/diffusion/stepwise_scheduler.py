@@ -78,6 +78,7 @@ class StepExecutionResult:
     step_indices: list[int]
     next_timesteps: list[float | None]
     finished: list[bool]
+    finish_reasons: list[str | None]
 
 
 class StepwiseScheduler:
@@ -316,8 +317,31 @@ class StepwiseScheduler:
             raise RuntimeError(f"Cannot finish non-active request_id={request_id}")
         state = self._active[request_id]
 
+        if finish_reason == "max_steps_reached":
+            finalize_method = "stepwise_finalize_request"
+        elif finish_reason == "paused":
+            finalize_method = "stepwise_finalize_paused_request"
+        else:
+            logger.error(
+                "Unsupported finish reason request_id=%s finish_reason=%s step_idx=%d max_steps=%d current_timestep=%s",
+                request_id,
+                finish_reason,
+                state.step_idx,
+                state.max_steps,
+                state.current_timestep,
+            )
+            raise RuntimeError(f"Unsupported finish reason '{finish_reason}' for request_id={request_id}")
+
+        logger.info(
+            "Finishing request_id=%s reason=%s step_idx=%d max_steps=%d current_timestep=%s",
+            request_id,
+            finish_reason,
+            state.step_idx,
+            state.max_steps,
+            state.current_timestep,
+        )
         output = self._rpc_call(
-            "stepwise_finalize_request",
+            finalize_method,
             args=(request_id,),
             kwargs={},
             output_rank=0,
@@ -464,6 +488,29 @@ class StepwiseScheduler:
                         self._fail_request(request_id, err)
                     continue
 
+                expected_len = len(step_result.request_ids)
+                if (
+                    len(step_result.row_indices) != expected_len
+                    or len(step_result.step_indices) != expected_len
+                    or len(step_result.next_timesteps) != expected_len
+                    or len(step_result.finished) != expected_len
+                    or len(step_result.finish_reasons) != expected_len
+                ):
+                    active_ids = list(self._active.keys())
+                    err = (
+                        "Invalid step result lengths: "
+                        f"request_ids={len(step_result.request_ids)} "
+                        f"row_indices={len(step_result.row_indices)} "
+                        f"step_indices={len(step_result.step_indices)} "
+                        f"next_timesteps={len(step_result.next_timesteps)} "
+                        f"finished={len(step_result.finished)} "
+                        f"finish_reasons={len(step_result.finish_reasons)}"
+                    )
+                    logger.error(err)
+                    for request_id in active_ids:
+                        self._fail_request(request_id, err)
+                    continue
+
                 for i, request_id in enumerate(step_result.request_ids):
                     if request_id not in self._active:
                         raise RuntimeError(f"Step result contains unknown request_id={request_id}")
@@ -471,7 +518,19 @@ class StepwiseScheduler:
                     state.step_idx = step_result.step_indices[i]
                     state.current_timestep = step_result.next_timesteps[i]
                     if step_result.finished[i]:
-                        self._finish_request(request_id, finish_reason="max_steps_reached")
+                        finish_reason = step_result.finish_reasons[i]
+                        if finish_reason is None:
+                            logger.error(
+                                "Missing finish_reason for finished request_id=%s plan_id=%s step_idx=%d max_steps=%d",
+                                request_id,
+                                step_result.plan_id,
+                                state.step_idx,
+                                state.max_steps,
+                            )
+                            raise RuntimeError(
+                                f"Step result missing finish_reason for finished request_id={request_id}"
+                            )
+                        self._finish_request(request_id, finish_reason=finish_reason)
             except Exception as exc:
                 logger.error("StepwiseScheduler main loop fatal error: %s", exc, exc_info=True)
                 active_ids = list(self._active.keys())

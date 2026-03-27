@@ -114,6 +114,7 @@ class MockStepwiseRPCWorker:
             step_indices=next_step_indices,
             next_timesteps=next_timesteps,
             finished=finished,
+            finish_reasons=["max_steps_reached" if is_finished else None for is_finished in finished],
         )
 
     def stepwise_finalize_request(self, request_id: str) -> DiffusionOutput:

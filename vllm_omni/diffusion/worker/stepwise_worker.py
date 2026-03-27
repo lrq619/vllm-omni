@@ -814,11 +814,22 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             if paused_request_ids:
                 self._commit_paused_requests(paused_request_ids)
 
-            final_finished = [bool(finished[i] or plan.request_ids[i] in paused_request_set) for i in range(len(plan.request_ids))]
-            final_next_timesteps = [
-                None if final_finished[i] else next_timesteps[i]
-                for i in range(len(plan.request_ids))
-            ]
+            final_finished: list[bool] = []
+            final_next_timesteps: list[float | None] = []
+            final_finish_reasons: list[str | None] = []
+            for i, request_id in enumerate(plan.request_ids):
+                if finished[i]:
+                    final_finished.append(True)
+                    final_next_timesteps.append(None)
+                    final_finish_reasons.append("max_steps_reached")
+                elif request_id in paused_request_set:
+                    final_finished.append(True)
+                    final_next_timesteps.append(None)
+                    final_finish_reasons.append("paused")
+                else:
+                    final_finished.append(False)
+                    final_next_timesteps.append(next_timesteps[i])
+                    final_finish_reasons.append(None)
 
             latency_ms = (time.perf_counter() - start_time) * 1000.0
             cuda_allocated_mb, cuda_reserved_mb = _cuda_mem_mb(latents.device)
@@ -835,7 +846,13 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 cuda_allocated_mb=cuda_allocated_mb,
                 cuda_reserved_mb=cuda_reserved_mb,
             )
-            logger.debug("Step execution done plan_id=%s request_ids=%s, stepwise step metric: %s", plan.plan_id, plan.request_ids, step_metric)
+            logger.debug(
+                "Step execution done plan_id=%s request_ids=%s finish_reasons=%s stepwise step metric: %s",
+                plan.plan_id,
+                plan.request_ids,
+                final_finish_reasons,
+                step_metric,
+            )
             # logger.info("Step execution done plan_id=%s request_ids=%s", plan.plan_id, plan.request_ids)
 
             return StepExecutionResult(
@@ -845,9 +862,10 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 step_indices=next_step_indices,
                 next_timesteps=final_next_timesteps,
                 finished=final_finished,
+                finish_reasons=final_finish_reasons,
             )
 
-    def stepwise_finalize_request(self, request_id: str) -> DiffusionOutput:
+    def _finalize_request(self, request_id: str, *, require_trajectory: bool, finish_reason: str) -> DiffusionOutput:
         manager = self._ensure_runtime()
         pipeline = self._pipeline()
         if request_id not in self._states:
@@ -863,16 +881,82 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             negative_prompt_embeds = manager.get("negative_prompt_embeds", row)
             negative_prompt_embeds_mask = manager.get("negative_prompt_embeds_mask", row)
 
-            if not state.collected_latents:
-                logger.error("No trajectory latents collected for request_id=%s", request_id)
-                raise RuntimeError(f"No trajectory latents collected for request_id={request_id}")
-            all_latents = torch.stack(state.collected_latents, dim=1)
+            all_latents = None
+            all_log_probs = None
+            all_timesteps = None
+            if require_trajectory:
+                if state.step_idx < state.max_steps:
+                    logger.error(
+                        "Finalize requested before max steps request_id=%s step_idx=%d max_steps=%d finish_reason=%s",
+                        request_id,
+                        state.step_idx,
+                        state.max_steps,
+                        finish_reason,
+                    )
+                    raise RuntimeError(
+                        "Finalize requested before max steps "
+                        f"for request_id={request_id}: step_idx={state.step_idx}, max_steps={state.max_steps}"
+                    )
+                if not state.collected_latents:
+                    logger.error(
+                        "No trajectory latents collected request_id=%s step_idx=%d max_steps=%d sde_window=%s "
+                        "collected_latents=%d collected_timesteps=%d collected_log_probs=%d",
+                        request_id,
+                        state.step_idx,
+                        state.max_steps,
+                        state.sde_window,
+                        len(state.collected_latents),
+                        len(state.collected_timesteps),
+                        len(state.collected_log_probs),
+                    )
+                    raise RuntimeError(
+                        "No trajectory latents collected "
+                        f"for request_id={request_id} at step_idx={state.step_idx}, sde_window={state.sde_window}"
+                    )
+                if len(state.collected_timesteps) != len(state.collected_latents):
+                    logger.error(
+                        "Trajectory length mismatch request_id=%s latents=%d timesteps=%d",
+                        request_id,
+                        len(state.collected_latents),
+                        len(state.collected_timesteps),
+                    )
+                    raise RuntimeError(
+                        "Trajectory length mismatch "
+                        f"for request_id={request_id}: latents={len(state.collected_latents)} "
+                        f"timesteps={len(state.collected_timesteps)}"
+                    )
+                if len(state.collected_log_probs) != len(state.collected_latents):
+                    logger.error(
+                        "Trajectory length mismatch request_id=%s latents=%d log_probs=%d",
+                        request_id,
+                        len(state.collected_latents),
+                        len(state.collected_log_probs),
+                    )
+                    raise RuntimeError(
+                        "Trajectory length mismatch "
+                        f"for request_id={request_id}: latents={len(state.collected_latents)} "
+                        f"log_probs={len(state.collected_log_probs)}"
+                    )
 
-            if state.collected_log_probs and state.collected_log_probs[0] is not None:
-                all_log_probs = torch.stack([x for x in state.collected_log_probs if x is not None], dim=1)
-            else:
-                all_log_probs = torch.zeros((latents.shape[0], len(state.collected_timesteps)), dtype=latents.dtype, device=latents.device)
-            all_timesteps = torch.stack(state.collected_timesteps).unsqueeze(0).expand(latents.shape[0], -1)
+                all_latents = torch.stack(state.collected_latents, dim=1)
+                if all(x is None for x in state.collected_log_probs):
+                    all_log_probs = torch.zeros(
+                        (latents.shape[0], len(state.collected_timesteps)),
+                        dtype=latents.dtype,
+                        device=latents.device,
+                    )
+                elif any(x is None for x in state.collected_log_probs):
+                    logger.error(
+                        "Trajectory log_prob consistency error request_id=%s collected_log_probs=%s",
+                        request_id,
+                        [x is None for x in state.collected_log_probs],
+                    )
+                    raise RuntimeError(
+                        f"Inconsistent trajectory log_probs for request_id={request_id}: mixed None and Tensor values"
+                    )
+                else:
+                    all_log_probs = torch.stack([x for x in state.collected_log_probs if x is not None], dim=1)
+                all_timesteps = torch.stack(state.collected_timesteps).unsqueeze(0).expand(latents.shape[0], -1)
 
             if state.output_type == "latent":
                 image = latents
@@ -894,20 +978,36 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 latents_unpacked = latents_unpacked / latents_std + latents_mean
                 image = pipeline.vae.decode(latents_unpacked, return_dict=False)[0][:, :, 0]
 
-            logger.info("Finalize complete request_id=%s", request_id)
-            return DiffusionOutput(
-                output=_maybe_to_cpu(image),
-                custom_output={
-                    "responses": _maybe_to_cpu(image),
-                    "all_latents": _maybe_to_cpu(all_latents),
-                    "rollout_log_probs": _maybe_to_cpu(all_log_probs),
-                    "all_timesteps": _maybe_to_cpu(all_timesteps),
-                    "prompt_embeds": _maybe_to_cpu(prompt_embeds),
-                    "prompt_embeds_mask": _maybe_to_cpu(prompt_embeds_mask),
-                    "negative_prompt_embeds": _maybe_to_cpu(negative_prompt_embeds),
-                    "negative_prompt_embeds_mask": _maybe_to_cpu(negative_prompt_embeds_mask),
-                },
+            custom_output = {
+                "responses": _maybe_to_cpu(image),
+                "prompt_embeds": _maybe_to_cpu(prompt_embeds),
+                "prompt_embeds_mask": _maybe_to_cpu(prompt_embeds_mask),
+                "negative_prompt_embeds": _maybe_to_cpu(negative_prompt_embeds),
+                "negative_prompt_embeds_mask": _maybe_to_cpu(negative_prompt_embeds_mask),
+                "finish_reason": finish_reason,
+                "step_idx": int(state.step_idx),
+                "max_steps": int(state.max_steps),
+            }
+            if require_trajectory:
+                custom_output["all_latents"] = _maybe_to_cpu(all_latents)
+                custom_output["rollout_log_probs"] = _maybe_to_cpu(all_log_probs)
+                custom_output["all_timesteps"] = _maybe_to_cpu(all_timesteps)
+
+            logger.info(
+                "Finalize complete request_id=%s finish_reason=%s step_idx=%d max_steps=%d include_trajectory=%s",
+                request_id,
+                finish_reason,
+                state.step_idx,
+                state.max_steps,
+                require_trajectory,
             )
+            return DiffusionOutput(output=_maybe_to_cpu(image), custom_output=custom_output)
+
+    def stepwise_finalize_request(self, request_id: str) -> DiffusionOutput:
+        return self._finalize_request(request_id, require_trajectory=True, finish_reason="max_steps_reached")
+
+    def stepwise_finalize_paused_request(self, request_id: str) -> DiffusionOutput:
+        return self._finalize_request(request_id, require_trajectory=False, finish_reason="paused")
 
     def stepwise_deadmit_request(self, request_id: str) -> None:
         manager = self._ensure_runtime()
