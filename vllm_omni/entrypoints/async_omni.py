@@ -4,7 +4,6 @@ import asyncio
 import copy
 import pickle
 import time
-import traceback
 import weakref
 import torch
 from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
@@ -44,13 +43,6 @@ _R = TypeVar("_R")
 logger = init_logger(__name__)
 
 
-def _format_close_trace(limit: int = 12) -> str:
-    stack = traceback.format_stack(limit=limit)
-    if stack:
-        stack = stack[:-1]
-    return "".join(stack).rstrip()
-
-
 def _weak_close_cleanup_async(async_omni_ref: "weakref.ReferenceType[AsyncOmni]") -> None:
     """Weak reference cleanup function for AsyncOmni instances."""
     async_omni = async_omni_ref()
@@ -63,12 +55,11 @@ def _weak_close_cleanup_async(async_omni_ref: "weakref.ReferenceType[AsyncOmni]"
     ray_pg = getattr(async_omni, "_ray_pg", None)
     zmq_ctx = getattr(async_omni, "_zmq_ctx", None)
 
-    logger.warning(
-        "[CloseTrace] _weak_close_cleanup_async invoked stage_count=%d in_queue_count=%d out_queue_count=%d",
+    logger.debug(
+        "AsyncOmni weak cleanup invoked stage_count=%d in_queue_count=%d out_queue_count=%d",
         len(stage_list) if stage_list is not None else -1,
         len(stage_in_queues) if stage_in_queues is not None else -1,
         len(stage_out_queues) if stage_out_queues is not None else -1,
-        # _format_close_trace(),  # Disabled: close-stack trace is too noisy in normal shutdown.
     )
     async_omni._closing = True
 
@@ -355,7 +346,7 @@ class AsyncOmni(OmniBase):
         Alias for close() method. Cleans up all stage processes
         and inter-process communication resources.
         """
-        logger.warning("[CloseTrace] AsyncOmni.shutdown invoked")
+        logger.debug("AsyncOmni.shutdown invoked")
         if hasattr(self, "_weak_finalizer"):
             self._weak_finalizer()
 
@@ -367,6 +358,7 @@ class AsyncOmni(OmniBase):
         *,
         output_modalities: list[str] | None = None,
         is_remote: bool = False,
+        pause_step_idx: int | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt asynchronously.
 
@@ -384,6 +376,9 @@ class AsyncOmni(OmniBase):
                 Must have the same length as the number of stages.
                 If None, uses default sampling params for each stage.
             output_modalities: Optional list of output modalities.
+            pause_step_idx: Optional step index for stepwise diffusion auto-pause.
+                When set, the request is paused immediately after executing that
+                step and finishes with pause reason.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
@@ -409,8 +404,45 @@ class AsyncOmni(OmniBase):
             if len(sampling_params_list) != len(self.stage_list):
                 raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
 
+            prompt_for_stage0 = prompt
+            if pause_step_idx is not None:
+                if isinstance(pause_step_idx, bool) or not isinstance(pause_step_idx, int):
+                    logger.error(
+                        "[%s] Invalid pause_step_idx for request_id=%s value=%r type=%s",
+                        self._name,
+                        request_id,
+                        pause_step_idx,
+                        type(pause_step_idx).__name__,
+                    )
+                    raise ValueError(
+                        f"pause_step_idx must be an integer >= 0 for request_id={request_id}, got {pause_step_idx!r}"
+                    )
+                if pause_step_idx < 0:
+                    logger.error(
+                        "[%s] Invalid pause_step_idx for request_id=%s value=%d (must be >= 0)",
+                        self._name,
+                        request_id,
+                        pause_step_idx,
+                    )
+                    raise ValueError(
+                        f"pause_step_idx must be >= 0 for request_id={request_id}, got {pause_step_idx}"
+                    )
+                if not isinstance(prompt, dict):
+                    logger.error(
+                        "[%s] pause_step_idx requires dict prompt payload request_id=%s prompt_type=%s",
+                        self._name,
+                        request_id,
+                        type(prompt).__name__,
+                    )
+                    raise ValueError(
+                        f"pause_step_idx requires dict prompt payload for request_id={request_id}, "
+                        f"got {type(prompt).__name__}"
+                    )
+                prompt_for_stage0 = dict(prompt)
+                prompt_for_stage0["pause_step_idx"] = pause_step_idx
+
             if is_remote:
-                self._store_remote_request_payload(request_id=request_id, prompt=prompt)
+                self._store_remote_request_payload(request_id=request_id, prompt=prompt_for_stage0)
 
             # Orchestrator keeps stage objects for input derivation
             num_stages = len(self.stage_list)
@@ -438,7 +470,7 @@ class AsyncOmni(OmniBase):
             sp0: SamplingParams = sampling_params_list[0]  # type: ignore[index]
             task = {
                 "request_id": request_id,
-                "engine_inputs": prompt,
+                "engine_inputs": prompt_for_stage0,
                 "sampling_params": sp0,
                 "is_remote": is_remote,
             }
@@ -1041,7 +1073,7 @@ class AsyncOmni(OmniBase):
     def close(self):
         if self._closed:
             return None
-        logger.warning("[CloseTrace] AsyncOmni.close invoked")
+        logger.debug("AsyncOmni.close invoked")
         self._closing = True
         if self.output_handler is not None:
             self.output_handler.cancel()

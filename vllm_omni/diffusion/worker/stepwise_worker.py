@@ -46,6 +46,7 @@ class WorkerRequestState:
     timesteps: list[float]
     step_idx: int
     max_steps: int
+    pause_step_idx: int | None
     do_true_cfg: bool
     true_cfg_scale: float
     noise_level: float
@@ -263,6 +264,12 @@ class DiffusionStepwiseWorker(DiffusionWorker):
 
     def _build_pause_state_payload(self, state: WorkerRequestState) -> dict[str, Any]:
         prompt = state.request.prompts[0] if state.request.prompts else {}
+        if isinstance(prompt, dict):
+            # pause_step_idx is a local control for the originating runtime.
+            # Do not forward it through remote payload to avoid auto-pausing
+            # again when replaying/resuming on another worker.
+            prompt = dict(prompt)
+            prompt.pop("pause_step_idx", None)
         current_timestep = None
         if 0 <= state.step_idx < len(state.timesteps):
             current_timestep = float(state.timesteps[state.step_idx])
@@ -273,6 +280,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             "row_index": state.row_index,
             "step_idx": state.step_idx,
             "max_steps": state.max_steps,
+            "pause_step_idx": state.pause_step_idx,
             "current_timestep": current_timestep,
             "timesteps": list(state.timesteps),
             "do_true_cfg": state.do_true_cfg,
@@ -469,6 +477,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 prompt_mask = custom_prompt.get("prompt_mask")
                 negative_prompt_ids = custom_prompt.get("negative_prompt_ids")
                 negative_prompt_mask = custom_prompt.get("negative_prompt_mask")
+                pause_step_idx_raw = custom_prompt.get("pause_step_idx")
                 if prompt_ids is None:
                     logger.warning("Missing prompt_ids in request_id=%s", request_id)
                     manager.release([row_index])
@@ -485,6 +494,39 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 height = sp.height or pipeline.default_sample_size * pipeline.vae_scale_factor
                 width = sp.width or pipeline.default_sample_size * pipeline.vae_scale_factor
                 num_inference_steps = int(sp.num_inference_steps)
+                pause_step_idx: int | None = None
+                if pause_step_idx_raw is not None:
+                    if isinstance(pause_step_idx_raw, bool) or not isinstance(pause_step_idx_raw, int):
+                        logger.error(
+                            "Invalid pause_step_idx request_id=%s value=%r type=%s",
+                            request_id,
+                            pause_step_idx_raw,
+                            type(pause_step_idx_raw).__name__,
+                        )
+                        raise RuntimeError(
+                            f"Invalid pause_step_idx for request_id={request_id}: {pause_step_idx_raw!r}"
+                        )
+                    if pause_step_idx_raw < 0:
+                        logger.error(
+                            "Invalid pause_step_idx request_id=%s value=%d (must be >= 0)",
+                            request_id,
+                            pause_step_idx_raw,
+                        )
+                        raise RuntimeError(
+                            f"Invalid pause_step_idx for request_id={request_id}: must be >= 0, got {pause_step_idx_raw}"
+                        )
+                    if pause_step_idx_raw >= num_inference_steps:
+                        logger.error(
+                            "Invalid pause_step_idx request_id=%s pause_step_idx=%d num_inference_steps=%d",
+                            request_id,
+                            pause_step_idx_raw,
+                            num_inference_steps,
+                        )
+                        raise RuntimeError(
+                            f"Invalid pause_step_idx for request_id={request_id}: {pause_step_idx_raw} "
+                            f">= num_inference_steps({num_inference_steps})"
+                        )
+                    pause_step_idx = int(pause_step_idx_raw)
                 max_sequence_length = int(pipeline.tokenizer_max_length + pipeline.prompt_template_encode_start_idx)
                 if sp.max_sequence_length is not None and int(sp.max_sequence_length) > max_sequence_length:
                     logger.error(
@@ -616,6 +658,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                     timesteps=[float(t) for t in timesteps],
                     step_idx=0,
                     max_steps=len(timesteps),
+                    pause_step_idx=pause_step_idx,
                     do_true_cfg=do_true_cfg,
                     true_cfg_scale=true_cfg_scale,
                     noise_level=noise_level,
@@ -634,11 +677,12 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                     scheduler=req_scheduler,
                 )
                 logger.info(
-                    "Stepwise admission complete request_id=%s row=%d max_steps=%d first_t=%.6f",
+                    "Stepwise admission complete request_id=%s row=%d max_steps=%d first_t=%.6f pause_step_idx=%s",
                     request_id,
                     row_index,
                     len(timesteps),
                     float(timesteps[0]),
+                    pause_step_idx,
                 )
                 return AdmissionResult(
                     request_id=request_id,
@@ -769,6 +813,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             next_step_indices: list[int] = []
             next_timesteps: list[float | None] = []
             finished: list[bool] = []
+            auto_paused_request_ids: list[str] = []
 
             for i, req_id in enumerate(plan.request_ids):
                 state = self._states[req_id]
@@ -808,8 +853,33 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 else:
                     next_timesteps.append(float(state.timesteps[state.step_idx]))
 
+                if state.pause_step_idx is not None:
+                    if step_index > state.pause_step_idx:
+                        logger.error(
+                            "Auto pause invariant violated request_id=%s step_index=%d pause_step_idx=%d",
+                            req_id,
+                            step_index,
+                            state.pause_step_idx,
+                        )
+                        raise RuntimeError(
+                            "Auto pause invariant violated "
+                            f"for request_id={req_id}: step_index={step_index} > pause_step_idx={state.pause_step_idx}"
+                        )
+                    if step_index == state.pause_step_idx and not done:
+                        auto_paused_request_ids.append(req_id)
+                        logger.info(
+                            "Auto pause triggered request_id=%s pause_step_idx=%d next_step_idx=%d",
+                            req_id,
+                            state.pause_step_idx,
+                            state.step_idx,
+                        )
+
             manager.put("latents", row_indices, torch.cat(next_latents, dim=0))
             paused_request_ids = self._drain_pause_commit_queue()
+            if auto_paused_request_ids:
+                paused_request_ids.extend(auto_paused_request_ids)
+            if paused_request_ids:
+                paused_request_ids = list(dict.fromkeys(paused_request_ids))
             paused_request_set = set(paused_request_ids)
             if paused_request_ids:
                 self._commit_paused_requests(paused_request_ids)
@@ -987,6 +1057,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 "finish_reason": finish_reason,
                 "step_idx": int(state.step_idx),
                 "max_steps": int(state.max_steps),
+                "pause_step_idx": state.pause_step_idx,
             }
             if require_trajectory:
                 custom_output["all_latents"] = _maybe_to_cpu(all_latents)

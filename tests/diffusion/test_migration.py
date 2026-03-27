@@ -231,6 +231,7 @@ async def _run_request(
     sampling_params: OmniDiffusionSamplingParams,
     out_root: Path,
     is_remote: bool = False,
+    pause_step_idx: int | None = None,
 ) -> tuple[OmniRequestOutput, dict[str, Any]]:
     logger.info(
         "[MigrationTrace] Starting request request_id=%s req_index=%s is_remote=%s out_root=%s",
@@ -251,6 +252,7 @@ async def _run_request(
             request_id=request_id,
             sampling_params_list=[sampling_params],
             is_remote=is_remote,
+            pause_step_idx=pause_step_idx,
         ):
             logger.info(
                 "[MigrationTrace] Streaming output request_id=%s finished=%s stage_id=%s",
@@ -433,3 +435,173 @@ async def _run_migration(tmp_path: Path) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
 def test_migration(tmp_path: Path):
     asyncio.run(_run_migration(tmp_path))
+
+
+async def _run_migration_with_pause_step_idx(tmp_path: Path) -> None:
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Requires at least 2 GPUs.")
+
+    model = os.getenv("VLLM_OMNI_STEPWISE_TEST_MODEL")
+    if not model:
+        pytest.skip("Set VLLM_OMNI_STEPWISE_TEST_MODEL to a valid stepwise-capable model path/name.")
+
+    tokenizer = _load_tokenizer_from_model(model)
+    prompt_messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": _PROMPT_TEXT},
+    ]
+    negative_prompt_messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": _NEG_PROMPT_TEXT},
+    ]
+    prompt_ids, prompt_mask = _chat_template_to_ids(tokenizer, prompt_messages)
+    negative_prompt_ids, negative_prompt_mask = _chat_template_to_ids(tokenizer, negative_prompt_messages)
+
+    out_root = Path("output/test_migration_pause_step_idx")
+    if out_root.exists():
+        shutil.rmtree(out_root)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    config0 = tmp_path / "stage_gpu0_pause_step_idx.yaml"
+    config1 = tmp_path / "stage_gpu1_pause_step_idx.yaml"
+    _write_single_stage_config(config0, 0)
+    _write_single_stage_config(config1, 1)
+
+    omni0 = _create_async_omni(model=model, config_path=config0)
+    omni1 = _create_async_omni(model=model, config_path=config1)
+
+    try:
+        req0_id = "migration-req-pause-step-idx-0"
+        req1_id = "migration-req-pause-step-idx-1"
+        pause_step_idx = 25
+        logger.info(
+            "[MigrationTrace] Created AsyncOmni instances; launching local requests with pause_step_idx=%d",
+            pause_step_idx,
+        )
+
+        task0 = asyncio.create_task(
+            _run_request(
+                omni0,
+                req_index=0,
+                request_id=req0_id,
+                prompt_text=_PROMPT_TEXT,
+                prompt_ids=prompt_ids,
+                prompt_mask=prompt_mask,
+                negative_prompt_ids=negative_prompt_ids,
+                negative_prompt_mask=negative_prompt_mask,
+                sampling_params=_make_sampling_params(),
+                out_root=out_root / "paused",
+                pause_step_idx=pause_step_idx,
+            )
+        )
+        task1 = asyncio.create_task(
+            _run_request(
+                omni0,
+                req_index=1,
+                request_id=req1_id,
+                prompt_text=_PROMPT_TEXT,
+                prompt_ids=prompt_ids,
+                prompt_mask=prompt_mask,
+                negative_prompt_ids=negative_prompt_ids,
+                negative_prompt_mask=negative_prompt_mask,
+                sampling_params=_make_sampling_params(),
+                out_root=out_root / "baseline",
+            )
+        )
+
+        logger.info("[MigrationTrace] Awaiting auto-paused task request_id=%s", req0_id)
+        paused_output, paused_payload = await task0
+        paused_custom_output = paused_payload.get("custom_output")
+        if not isinstance(paused_custom_output, dict):
+            raise RuntimeError(
+                f"Missing custom_output for paused request_id={req0_id}: {type(paused_custom_output).__name__}"
+            )
+        paused_finish_reason = paused_custom_output.get("finish_reason")
+        if paused_finish_reason != "paused":
+            raise RuntimeError(
+                f"Expected paused finish_reason for request_id={req0_id}, got {paused_finish_reason!r}"
+            )
+        paused_step_idx = paused_custom_output.get("step_idx")
+        expected_paused_step_idx = pause_step_idx + 1
+        if paused_step_idx != expected_paused_step_idx:
+            raise RuntimeError(
+                f"Unexpected paused step_idx for request_id={req0_id}: "
+                f"expected {expected_paused_step_idx}, got {paused_step_idx}"
+            )
+        logger.info(
+            "[MigrationTrace] Auto-paused task completed request_id=%s step_idx=%s",
+            req0_id,
+            paused_step_idx,
+        )
+
+        logger.info("[MigrationTrace] Launching remote replay request_id=%s", req0_id)
+        remote_task = asyncio.create_task(
+            _run_request(
+                omni1,
+                req_index=0,
+                request_id=req0_id,
+                prompt_text=_PROMPT_TEXT,
+                prompt_ids=prompt_ids,
+                prompt_mask=prompt_mask,
+                negative_prompt_ids=negative_prompt_ids,
+                negative_prompt_mask=negative_prompt_mask,
+                sampling_params=_make_sampling_params(),
+                out_root=out_root / "remote",
+                is_remote=True,
+            )
+        )
+
+        logger.info("[MigrationTrace] Awaiting baseline task request_id=%s", req1_id)
+        baseline_output, baseline_payload = await task1
+        logger.info(
+            "[MigrationTrace] Baseline task completed request_id=%s output_request_id=%s",
+            req1_id,
+            baseline_output.request_id,
+        )
+        logger.info("[MigrationTrace] Awaiting remote task request_id=%s", req0_id)
+        remote_output, remote_payload = await remote_task
+        logger.info(
+            "[MigrationTrace] Remote task completed request_id=%s output_request_id=%s",
+            req0_id,
+            remote_output.request_id,
+        )
+
+        normalized_baseline = dict(baseline_payload)
+        normalized_remote = dict(remote_payload)
+        normalized_baseline.pop("request_id", None)
+        normalized_baseline.pop("image_path", None)
+        normalized_remote.pop("request_id", None)
+        normalized_remote.pop("image_path", None)
+
+        assert normalized_baseline == normalized_remote, "Migrated output does not match baseline output."
+
+        baseline_img = Image.open(out_root / "baseline" / "req_1" / "output.png").convert("RGB")
+        remote_img = Image.open(out_root / "remote" / "req_0" / "output.png").convert("RGB")
+        assert np.array_equal(np.array(baseline_img), np.array(remote_img)), "Migrated image does not match baseline image."
+
+        comparison = {
+            "paused_request_id": req0_id,
+            "baseline_request_id": req1_id,
+            "remote_request_id": req0_id,
+            "baseline_vs_remote_equal": True,
+            "pause_step_idx": pause_step_idx,
+            "paused_payload": paused_payload,
+            "baseline_payload": baseline_payload,
+            "remote_payload": remote_payload,
+            "paused_output_request_id": paused_output.request_id,
+            "baseline_output_request_id": baseline_output.request_id,
+            "remote_output_request_id": remote_output.request_id,
+        }
+        (out_root / "comparison.json").write_text(json.dumps(comparison, ensure_ascii=True), encoding="utf-8")
+    except Exception:
+        logger.exception("[MigrationTrace] Migration flow with pause_step_idx failed before cleanup")
+        raise
+    finally:
+        logger.info("[MigrationTrace] Entering cleanup for migration pause_step_idx test")
+        omni0.close()
+        omni1.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
+def test_migration_with_pause_step_idx(tmp_path: Path):
+    asyncio.run(_run_migration_with_pause_step_idx(tmp_path))
