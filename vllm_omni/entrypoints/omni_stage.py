@@ -709,7 +709,8 @@ class OmniStage:
             Result dictionary if available, None otherwise. Result contains
             request_id, engine_outputs (or engine_outputs_shm), and metrics.
         """
-        assert self._out_q is not None
+        if self._out_q is None:
+            return None
         try:
             return self._out_q.get_nowait()
         except Exception:

@@ -162,7 +162,11 @@ class MooncakeStore:
         result = 0
         if key in self._cached_keys:
             result = self.storage_client.remove(key)
-            if result == 0 or result == -706:
+            if result == -704:
+                logger.warning("Key '%s' is already removed during delete.", key)
+                del self._cached_keys[key]
+                result = 0
+            elif result == 0 or result == -706:
                 del self._cached_keys[key]
                 result = 0
         return result
@@ -177,7 +181,9 @@ class MooncakeStore:
             return
         for key in list(self._cached_keys.keys()):
             result = self.storage_client.remove(key)
-            if result != 0 and result != -706:
+            if result == -704:
+                logger.warning("Key '%s' is already removed during clear.", key)
+            elif result != 0 and result != -706:
                 logger.warning("Failed to remove key '%s' during clear, error code: %s", key, result)
         self._cached_keys.clear()
 

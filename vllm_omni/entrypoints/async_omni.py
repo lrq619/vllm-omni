@@ -50,8 +50,18 @@ def _format_close_trace(limit: int = 12) -> str:
     return "".join(stack).rstrip()
 
 
-def _weak_close_cleanup_async(stage_list, stage_in_queues, stage_out_queues, ray_pg, output_handler, zmq_ctx=None):
+def _weak_close_cleanup_async(async_omni_ref: "weakref.ReferenceType[AsyncOmni]") -> None:
     """Weak reference cleanup function for AsyncOmni instances."""
+    async_omni = async_omni_ref()
+    if async_omni is None:
+        return
+
+    stage_list = getattr(async_omni, "stage_list", None)
+    stage_in_queues = getattr(async_omni, "_stage_in_queues", None)
+    stage_out_queues = getattr(async_omni, "_stage_out_queues", None)
+    ray_pg = getattr(async_omni, "_ray_pg", None)
+    zmq_ctx = getattr(async_omni, "_zmq_ctx", None)
+
     logger.warning(
         "[CloseTrace] _weak_close_cleanup_async invoked stage_count=%d in_queue_count=%d out_queue_count=%d\n%s",
         len(stage_list) if stage_list is not None else -1,
@@ -59,28 +69,19 @@ def _weak_close_cleanup_async(stage_list, stage_in_queues, stage_out_queues, ray
         len(stage_out_queues) if stage_out_queues is not None else -1,
         _format_close_trace(),
     )
+    async_omni._closing = True
+
+    output_handler = getattr(async_omni, "output_handler", None)
+    if output_handler is not None:
+        output_handler.cancel()
+
     if stage_list:
-        for q in stage_in_queues:
-            try:
-                q.put_nowait(SHUTDOWN_TASK)
-            except Exception as e:
-                logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
-            close_fn = getattr(q, "close", None)
-            if callable(close_fn):
-                close_fn()
-        for q in stage_out_queues:
-            close_fn = getattr(q, "close", None)
-            if callable(close_fn):
-                close_fn()
         for stage in stage_list:
             try:
                 stage.stop_stage_worker()
             except Exception as e:
                 logger.warning(f"Failed to stop stage worker: {e}")
     try_close_ray(ray_pg)
-    # Cancel output handler
-    if output_handler is not None:
-        output_handler.cancel()
     if zmq_ctx is not None:
         zmq_ctx.term()
 
@@ -130,6 +131,8 @@ class AsyncOmni(OmniBase):
         # Request state tracking
         self.request_states: dict[str, ClientRequestState] = {}
         self.output_handler: asyncio.Task | None = None
+        self._closing: bool = False
+        self._closed: bool = False
 
         # RPC results storage: {stage_id: {rpc_id: result}}
         # Used to avoid race condition between output_handler and collective_rpc
@@ -138,16 +141,16 @@ class AsyncOmni(OmniBase):
 
         super().__init__(model, **kwargs)
 
+        if hasattr(self, "_weak_finalizer"):
+            # Replace OmniBase cleanup with async-specific cleanup to avoid
+            # duplicate teardown paths and queue/socket races.
+            self._weak_finalizer.detach()
+
         # Register weak reference cleanup (called on garbage collection)
         self._weak_finalizer = weakref.finalize(
             self,
             _weak_close_cleanup_async,
-            self.stage_list,
-            self._stage_in_queues,
-            self._stage_out_queues,
-            self._ray_pg,
-            self.output_handler,
-            self._zmq_ctx,
+            weakref.ref(self),
         )
 
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -680,6 +683,8 @@ class AsyncOmni(OmniBase):
         return engine_outputs, finished, output_to_yield
 
     def _run_output_handler(self) -> None:
+        if self._closing or self._closed:
+            return
         if self.output_handler is not None:
             return
 
@@ -688,9 +693,11 @@ class AsyncOmni(OmniBase):
 
         async def output_handler():
             try:
-                while True:
+                while not self._closing:
                     idle = True
                     for stage_id, stage in enumerate(stage_list):
+                        if self._closing:
+                            break
                         result = stage.try_collect()
                         if result is None:
                             continue
@@ -727,6 +734,8 @@ class AsyncOmni(OmniBase):
                         await asyncio.sleep(0.001)  # Avoid CPU overload when idle
                     else:
                         await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                logger.debug("AsyncOmni output_handler cancelled")
             except Exception as e:
                 logger.exception("AsyncOmni output_handler failed.")
                 for req_state in request_states.values():
@@ -738,6 +747,7 @@ class AsyncOmni(OmniBase):
                     else:
                         await req_state.queue.put(error_msg)
                     error_msg = {"request_id": req_state.request_id, "error": str(e)}
+            finally:
                 self.output_handler = None  # Make possible for restart
 
         self.output_handler = asyncio.create_task(output_handler())
@@ -1028,11 +1038,18 @@ class AsyncOmni(OmniBase):
             return self._paused
 
     def close(self):
+        if self._closed:
+            return None
         logger.warning("[CloseTrace] AsyncOmni.close invoked\n%s", _format_close_trace())
+        self._closing = True
+        if self.output_handler is not None:
+            self.output_handler.cancel()
+            self.output_handler = None
         if self._mooncake_store is not None:
             try:
                 self._mooncake_store.shutdown()
             except Exception:
                 pass
             self._mooncake_store = None
+        self._closed = True
         return super().close()
