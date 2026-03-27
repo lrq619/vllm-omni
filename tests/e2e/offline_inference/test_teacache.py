@@ -30,17 +30,26 @@ from vllm_omni.outputs import OmniRequestOutput
 
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
-# Use random weights model for testing
-models = ["riverclouds/qwen_image_random"]
+_MODEL_ENV_VAR = "VLLM_OMNI_STEPWISE_TEST_MODEL"
+
+
+def _get_model_name_from_env() -> str:
+    model_name = os.environ.get(_MODEL_ENV_VAR)
+    if not model_name:
+        raise RuntimeError(
+            f"Missing required environment variable '{_MODEL_ENV_VAR}'. "
+            f"Please export {_MODEL_ENV_VAR}=/tmp/models/Qwen/Qwen-Image before running this test."
+        )
+    return model_name
 
 
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.cache
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.parametrize("model_name", models)
-def test_teacache(model_name: str):
+def test_teacache():
     """Test TeaCache backend with diffusion model."""
+    model_name = _get_model_name_from_env()
     # Configure TeaCache with default settings for fast testing
     cache_config = {
         "rel_l1_thresh": 0.2,  # Default threshold
@@ -159,12 +168,11 @@ async def _run_async_teacache_custom_pipeline(model_name: str) -> OmniRequestOut
 @pytest.mark.diffusion
 @pytest.mark.cache
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.parametrize("model_name", models)
 def test_async_teacache_custom_pipeline_logs_skipped_steps(
-    model_name: str,
     capfd: pytest.CaptureFixture[str],
 ):
     """Test TeaCache skip-step logging with AsyncOmni + custom non-step Qwen pipeline."""
+    model_name = _get_model_name_from_env()
     final_output = asyncio.run(_run_async_teacache_custom_pipeline(model_name))
 
     if not hasattr(final_output, "final_output_type"):
