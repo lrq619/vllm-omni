@@ -6,6 +6,7 @@ import pickle
 import time
 import traceback
 import weakref
+import torch
 from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
 from typing import Any, TypeVar
 
