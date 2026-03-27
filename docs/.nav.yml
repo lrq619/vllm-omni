@@ -45,6 +45,7 @@ nav:
     - Sleep Mode: features/sleep_mode.md
     - Diffusion Features:
       - Acceleration Overview: user_guide/diffusion_acceleration.md
+      - Stepwise Diffusion: user_guide/diffusion/stepwise.md
       - TeaCache: user_guide/diffusion/teacache.md
       - Cache-DiT: user_guide/diffusion/cache_dit_acceleration.md
       - Quantization:
