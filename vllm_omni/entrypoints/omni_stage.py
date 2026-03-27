@@ -618,12 +618,12 @@ class OmniStage:
         Handles both multiprocessing Process and Ray Actor.
         """
         logger.warning(
-            "[CloseTrace] OmniStage.stop_stage_worker invoked stage_id=%s stage_type=%s has_in_q=%s has_out_q=%s\n%s",
+            "[CloseTrace] OmniStage.stop_stage_worker invoked stage_id=%s stage_type=%s has_in_q=%s has_out_q=%s",
             self.stage_id,
             self.stage_type,
             self._in_q is not None,
             self._out_q is not None,
-            _format_close_trace(),
+            # _format_close_trace(),  # Disabled: close-stack trace is too noisy in normal shutdown.
         )
         if self._in_q is not None:
             try:
