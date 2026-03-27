@@ -25,6 +25,15 @@ _MODEL_COEFFICIENTS = {
         3.20000000e00,
         -2.00000000e-02,
     ],
+    # Qwen-Image custom non-step transformer (inherits QwenImageTransformer2DModel)
+    # Reuse Qwen-Image coefficients to keep behavior consistent with the base architecture
+    "QwenImageTransformer2DModelFixed": [
+        -4.50000000e02,
+        2.80000000e02,
+        -4.50000000e01,
+        3.20000000e00,
+        -2.00000000e-02,
+    ],
     # Bagel transformer coefficients
     # Using Qwen's coefficients as reasonable default given shared architecture
     "Bagel": [1.33313129e06, -1.68644226e05, 7.95050740e03, -1.63747873e02, 1.26352397e00],

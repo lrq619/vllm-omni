@@ -574,6 +574,7 @@ def extract_zimage_context(
 # on the transformer module and multiple pipelines can share the same transformer.
 EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "QwenImageTransformer2DModel": extract_qwen_context,
+    "QwenImageTransformer2DModelFixed": extract_qwen_context,
     "Bagel": extract_bagel_context,
     "ZImageTransformer2DModel": extract_zimage_context,
     # Future models:

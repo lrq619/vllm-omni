@@ -25,11 +25,11 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.models.qwen_image.scheduling_flow_match_sde_discrete import FlowMatchSDEDiscreteScheduler
-from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer_step import QwenImageTransformer2DModelStep
+from vllm_omni.diffusion.models.qwen_image.non_step.scheduling_flow_match_sde_discrete import FlowMatchSDEDiscreteScheduler
+from vllm_omni.diffusion.models.qwen_image.non_step.qwen_image_transformer import QwenImageTransformer2DModelFixed
 
 
-QwenImageTransformer2DModelFixed = QwenImageTransformer2DModelStep
+# QwenImageTransformer2DModelFixed = QwenImageTransformer2DModelStep
 
 
 def _maybe_to_cpu(v):

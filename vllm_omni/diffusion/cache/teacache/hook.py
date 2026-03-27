@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.extractors import get_extractor
@@ -25,6 +26,8 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
 )
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook, StateManager
+
+logger = init_logger(__name__)
 
 
 class TeaCacheHook(ModelHook):
@@ -144,6 +147,15 @@ class TeaCacheHook(ModelHook):
             # ============================================================================
             # FAST PATH: Reuse cached residuals
             # ============================================================================
+            logger.info(
+                "TEACACHE_STEP_SKIPPED transformer=%s branch=%s step_idx=%d "
+                "accumulated_rel_l1_distance=%.8f rel_l1_thresh=%.8f",
+                self.config.transformer_type,
+                cache_branch,
+                state.cnt,
+                state.accumulated_rel_l1_distance,
+                self.config.rel_l1_thresh,
+            )
             ctx.hidden_states = ctx.hidden_states + state.previous_residual
             if state.previous_residual_encoder is not None and ctx.encoder_hidden_states is not None:
                 ctx.encoder_hidden_states = ctx.encoder_hidden_states + state.previous_residual_encoder
