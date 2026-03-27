@@ -89,6 +89,146 @@ outputs = omni.generate(
 )
 ```
 
+### AsyncOmni + Custom Pipeline (Qwen non-step)
+
+Use this mode when you load a custom diffusion pipeline via `diffusion_load_format="custom_pipeline"`, for example:
+`vllm_omni.diffusion.models.qwen_image.non_step.pipeline_qwenimage.QwenImagePipelineWithLogProb`.
+
+```python
+import asyncio
+
+from transformers import AutoTokenizer
+
+from vllm_omni import AsyncOmni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+MODEL = "/tmp/models/Qwen/Qwen-Image"
+
+
+def build_custom_prompt(tokenizer):
+    # This custom pipeline expects prompt ids/masks in prompt dict.
+    messages = [
+        {"role": "system", "content": "Describe the image in detail."},
+        {"role": "user", "content": "A green apple on a wooden table."},
+    ]
+    neg_messages = [
+        {"role": "system", "content": "Describe the image in detail."},
+        {"role": "user", "content": " "},
+    ]
+    prompt_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+    negative_prompt_ids = tokenizer.apply_chat_template(neg_messages, tokenize=True, add_generation_prompt=True)
+    return {
+        "prompt_ids": prompt_ids,
+        "prompt_mask": None,
+        "negative_prompt_ids": negative_prompt_ids,
+        "negative_prompt_mask": None,
+    }
+
+
+async def main():
+    tokenizer = AutoTokenizer.from_pretrained(f"{MODEL}/tokenizer", local_files_only=True, trust_remote_code=True)
+    prompt = build_custom_prompt(tokenizer)
+
+    omni = AsyncOmni(
+        model=MODEL,
+        num_gpus=1,
+        diffusion_load_format="custom_pipeline",
+        custom_pipeline_args={
+            "pipeline_class": (
+                "vllm_omni.diffusion.models.qwen_image.non_step.pipeline_qwenimage."
+                "QwenImagePipelineWithLogProb"
+            )
+        },
+        cache_backend="tea_cache",
+        cache_config={"rel_l1_thresh": 0.2},
+    )
+
+    sampling_params = OmniDiffusionSamplingParams(
+        num_inference_steps=50,
+        true_cfg_scale=4.0,
+        width=512,
+        height=512,
+        output_type="pil",
+        seed=42,
+        extra_args={
+            "noise_level": 1.0,
+            "sde_type": "sde",
+            "logprobs": True,
+            "sde_window_size": 2,
+            "sde_window_range": [0, 5],
+            # New behavior: do not skip any step inside sde_window.
+            "teacache_no_skip_in_sde_window": True,
+        },
+    )
+
+    final_output = None
+    try:
+        async for out in omni.generate(
+            prompt=prompt,
+            request_id="async-teacache-custom-pipeline-demo",
+            sampling_params_list=[sampling_params],
+        ):
+            final_output = out
+    finally:
+        omni.close()
+
+    teacache_metrics = final_output.custom_output["teacache_metrics"]
+    print("executed steps:", teacache_metrics["denoise_executed_steps"])
+    print("fully skipped steps:", teacache_metrics["denoise_fully_skipped_steps"])
+    print("skipped calls in sde_window:", teacache_metrics["transformer_skipped_calls_in_sde_window"])
+
+
+asyncio.run(main())
+```
+
+## AsyncOmni Parameters (Custom Pipeline + TeaCache)
+
+### Engine-level parameters
+
+- `cache_backend`: set to `"tea_cache"` to enable TeaCache.
+- `cache_config.rel_l1_thresh`: TeaCache threshold controlling speed/quality tradeoff.
+- `diffusion_load_format`: set to `"custom_pipeline"` when loading custom pipeline classes.
+- `custom_pipeline_args.pipeline_class`: full import path of your custom pipeline class.
+
+### Sampling-level parameters (`OmniDiffusionSamplingParams.extra_args`)
+
+- `noise_level` (`float`): SDE noise injection strength in the SDE window.
+- `sde_type` (`"sde"` or `"cps"`): scheduler branch used in the SDE step rule.
+- `logprobs` (`bool`): whether to compute rollout logprobs.
+- `sde_window_size` (`int`): random SDE window length.
+- `sde_window_range` (`[start, end]`): sampling range for random SDE window start.
+- `teacache_no_skip_in_sde_window` (`bool`, default `True` in this pipeline):
+  when `True`, TeaCache will force compute all denoise steps inside `sde_window` (no skip).
+
+## Getting Actual Executed Steps
+
+For this custom pipeline, TeaCache metrics are returned in:
+
+```python
+metrics = final_output.custom_output["teacache_metrics"]
+```
+
+Important fields:
+
+- `denoise_executed_steps`: number of denoise steps that were actually executed (at least once).
+- `denoise_fully_skipped_steps`: number of denoise steps fully skipped by TeaCache.
+- `transformer_skipped_calls`: skipped transformer calls (call-level metric).
+- `transformer_skipped_calls_in_sde_window`: skipped calls inside `sde_window` (expected `0` when `teacache_no_skip_in_sde_window=True`).
+- `sde_window`: actual `[start, end]` window used in this generation.
+
+Note:
+
+- Step-level metrics and call-level metrics are different under CFG.
+- With CFG enabled, one denoise step may invoke transformer multiple times (positive/negative branches).
+
+## Error Signaling (No Silent Fallback in New Path)
+
+For the new AsyncOmni custom-pipeline TeaCache path, invalid metadata is reported with explicit errors and logs:
+
+- Missing TeaCache hook while `cache_backend="tea_cache"`: raises `RuntimeError`.
+- Invalid `teacache_step_index` / `teacache_num_denoise_steps` / `teacache_sde_window`: raises `TypeError` or `ValueError`.
+- Inconsistent step metadata across one request: raises `ValueError`.
+
 ## Performance Tuning
 
 Start with the default `rel_l1_thresh=0.2` and adjust based on your needs:
