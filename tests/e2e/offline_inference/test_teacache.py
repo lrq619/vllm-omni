@@ -300,22 +300,12 @@ def test_async_teacache_custom_pipeline_logs_skipped_steps(
         f"got {final_output.final_output_type!r}."
     )
 
-    if not hasattr(final_output, "request_output") or not final_output.request_output:
-        raise ValueError(
-            "AsyncOmni final output does not contain request_output entries in custom pipeline TeaCache test."
-        )
-
-    req_out = final_output.request_output[0]
-    if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
-        raise TypeError(
-            "Unexpected request_output structure in AsyncOmni custom pipeline TeaCache test. "
-            f"Type={type(req_out)!r}, has_images={hasattr(req_out, 'images')}."
-        )
-    if req_out.images is None or len(req_out.images) == 0:
+    try:
+        _extract_output_image(final_output)
+    except Exception as e:
         raise AssertionError(
-            "AsyncOmni custom pipeline TeaCache test produced no images. "
-            "TeaCache should still return image outputs."
-        )
+            "AsyncOmni custom pipeline TeaCache test produced no extractable image output."
+        ) from e
 
     captured = capfd.readouterr()
     combined_logs = f"{captured.out}\n{captured.err}"
