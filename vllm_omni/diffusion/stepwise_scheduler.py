@@ -161,6 +161,7 @@ class StepwiseScheduler:
             raise ValueError("Stepwise runtime requires request.request_ids[0].")
         request_id = request.request_ids[0]
         is_remote = bool(request.is_remote_list[0]) if request.is_remote_list else False
+        logger.info("Queued request_id=%s is_remote=%s", request_id, is_remote)
         state = RequestRuntimeState(
             request_id=request_id,
             status="pending",
@@ -411,6 +412,12 @@ class StepwiseScheduler:
                             break
                         request, state = self._pending.popleft()
                     try:
+                        if state.is_remote:
+                            logger.info(
+                                "Dispatching remote admission request_id=%s state_step_idx=%d",
+                                state.request_id,
+                                state.step_idx,
+                            )
                         admission = self._admit_remote_unimplemented(request) if state.is_remote else self._admit_local(request, state)
                         if not admission.admitted:
                             state.status = "finished"
