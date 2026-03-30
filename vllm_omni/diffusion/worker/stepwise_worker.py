@@ -620,7 +620,8 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             field_name="collected_timesteps_keys",
         )
         collected_timesteps = [
-            store.get_tensor(key, device=self._pipeline().device) for key in collected_timesteps_keys
+            store.get_tensor(key, device=self._pipeline().device).reshape(())
+            for key in collected_timesteps_keys
         ]
 
         state["generator_state"] = generator_state
