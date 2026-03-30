@@ -164,7 +164,7 @@ class QwenImagePipelineWithLogProbStep(QwenImagePipeline):
         timesteps,
         do_true_cfg,
         guidance,
-        true_cfg_scale,
+        guidance_scale,
         noise_level,
         sde_window,
         sde_type,
@@ -221,7 +221,7 @@ class QwenImagePipelineWithLogProbStep(QwenImagePipeline):
                 negative_txt_seq_lens=negative_txt_seq_lens,
                 do_true_cfg=do_true_cfg,
                 guidance=guidance,
-                true_cfg_scale=true_cfg_scale,
+                guidance_scale=guidance_scale,
                 noise_level=noise_level,
                 sde_window=sde_window,
                 sde_type=sde_type,
@@ -266,7 +266,7 @@ class QwenImagePipelineWithLogProbStep(QwenImagePipeline):
         negative_txt_seq_lens,
         do_true_cfg: bool,
         guidance: torch.Tensor | None,
-        true_cfg_scale: float,
+        guidance_scale: float,
         noise_level: float,
         sde_window: tuple[int, int],
         sde_type: Literal["sde", "cps"],
@@ -316,7 +316,7 @@ class QwenImagePipelineWithLogProbStep(QwenImagePipeline):
                 attention_kwargs=self.attention_kwargs,
                 return_dict=False,
             )[0]
-            comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+            comb_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
             cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
             noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
             noise_pred = comb_pred * (cond_norm / noise_norm)
@@ -349,7 +349,6 @@ class QwenImagePipelineWithLogProbStep(QwenImagePipeline):
         prompt_mask: torch.Tensor | None = None,
         negative_prompt_ids: torch.Tensor | list[int] | None = None,
         negative_prompt_mask: torch.Tensor | None = None,
-        true_cfg_scale: float = 4.0,
         height: int | None = None,
         width: int | None = None,
         num_inference_steps: int = 50,
@@ -400,7 +399,6 @@ class QwenImagePipelineWithLogProbStep(QwenImagePipeline):
             generator = torch.Generator(device=self.device).manual_seed(sp.seed)
         if generator:
             print(f"roll generator.seed: {generator.initial_seed()}")
-        true_cfg_scale = sp.true_cfg_scale or true_cfg_scale
         req_num_outputs = getattr(sp, "num_outputs_per_prompt", None)
         if req_num_outputs and req_num_outputs > 0:
             num_images_per_prompt = req_num_outputs
@@ -428,7 +426,7 @@ class QwenImagePipelineWithLogProbStep(QwenImagePipeline):
             negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
         )
 
-        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+        do_true_cfg = guidance_scale > 1 and has_neg_prompt
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(
             prompt_ids=prompt_ids,
             attention_mask=prompt_mask,
@@ -504,7 +502,7 @@ class QwenImagePipelineWithLogProbStep(QwenImagePipeline):
             timesteps,
             do_true_cfg,
             guidance,
-            true_cfg_scale,
+            guidance_scale,
             noise_level,
             sde_window,
             sde_type,
