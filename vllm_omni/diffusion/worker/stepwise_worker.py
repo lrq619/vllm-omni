@@ -441,6 +441,21 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             )
         return embeds, mask
 
+    @staticmethod
+    def _trim_prompt_to_mask_len(embeds: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if embeds.ndim != 3 or mask.ndim != 2:
+            raise RuntimeError(
+                f"Invalid prompt tensor rank: embeds.ndim={embeds.ndim}, mask.ndim={mask.ndim}"
+            )
+        if embeds.shape[0] != mask.shape[0] or embeds.shape[1] != mask.shape[1]:
+            raise RuntimeError(
+                "Prompt tensor shape mismatch: "
+                f"embeds.shape={tuple(embeds.shape)} mask.shape={tuple(mask.shape)}"
+            )
+        valid_lens = mask.to(dtype=torch.int64).sum(dim=1)
+        max_valid_len = int(valid_lens.max().item()) if valid_lens.numel() > 0 else 0
+        return embeds[:, :max_valid_len, :], mask[:, :max_valid_len]
+
     def stepwise_admit_request(self, request_id: str, request: OmniDiffusionRequest) -> AdmissionResult:
         manager = self._ensure_runtime()
         if request_id in self._states:
@@ -1025,6 +1040,11 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             prompt_embeds_mask = manager.get("prompt_embeds_mask", row)
             negative_prompt_embeds = manager.get("negative_prompt_embeds", row)
             negative_prompt_embeds_mask = manager.get("negative_prompt_embeds_mask", row)
+            prompt_embeds, prompt_embeds_mask = self._trim_prompt_to_mask_len(prompt_embeds, prompt_embeds_mask)
+            negative_prompt_embeds, negative_prompt_embeds_mask = self._trim_prompt_to_mask_len(
+                negative_prompt_embeds,
+                negative_prompt_embeds_mask,
+            )
 
             all_latents = None
             all_log_probs = None
