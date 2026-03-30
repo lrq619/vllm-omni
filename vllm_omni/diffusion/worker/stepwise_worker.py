@@ -29,12 +29,12 @@ from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 
 logger = init_logger(__name__)
 
-REMOTE_PROMPT_TENSOR_NAMES = (
-    "prompt_ids",
-    "prompt_mask",
-    "negative_prompt_ids",
-    "negative_prompt_mask",
-)
+# REMOTE_PROMPT_TENSOR_NAMES = (
+#     "prompt_ids",
+#     "prompt_mask",
+#     "negative_prompt_ids",
+#     "negative_prompt_mask",
+# )
 PAUSE_STATE_TENSOR_FIELDS = (
     "generator_state",
     "collected_latents",
@@ -524,7 +524,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             "txt_seq_len": state.txt_seq_len,
             "negative_txt_seq_len": state.negative_txt_seq_len,
             "prompt": self._strip_tensors_for_state(prompt),
-            "tensor_names": list(REMOTE_PROMPT_TENSOR_NAMES),
+            # "tensor_names": list(REMOTE_PROMPT_TENSOR_NAMES),
             "tensor_pool_names": list(self._ensure_runtime().pools.keys()),
             "generator_state_is_list": generator_state_is_list,
             "generator_state_keys": generator_state_keys,
@@ -556,15 +556,15 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 f"Remote state payload for request_id={request_id} must contain dict prompt payload."
             )
 
-        tensor_names = _string_list(
-            state.get("tensor_names"),
-            request_id=request_id,
-            field_name="tensor_names",
-        )
-        if tensor_names != list(REMOTE_PROMPT_TENSOR_NAMES):
-            raise RuntimeError(
-                f"Remote state payload for request_id={request_id} has unexpected tensor_names={tensor_names!r}"
-            )
+        # tensor_names = _string_list(
+        #     state.get("tensor_names"),
+        #     request_id=request_id,
+        #     field_name="tensor_names",
+        # )
+        # if tensor_names != list(REMOTE_PROMPT_TENSOR_NAMES):
+        #     raise RuntimeError(
+        #         f"Remote state payload for request_id={request_id} has unexpected tensor_names={tensor_names!r}"
+        #     )
         tensor_pool_names = _string_list(
             state.get("tensor_pool_names"),
             request_id=request_id,
@@ -693,19 +693,19 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                     f"Paused request_id={request_id} must have dict prompt payload for prompt tensor export."
                 )
 
-            prompt_tensors: dict[str, torch.Tensor] = {}
-            for tensor_name in REMOTE_PROMPT_TENSOR_NAMES:
-                tensor_value = prompt.get(tensor_name)
-                if tensor_value is None:
-                    raise RuntimeError(
-                        f"Paused request_id={request_id} is missing prompt tensor '{tensor_name}'"
-                    )
-                if not isinstance(tensor_value, torch.Tensor):
-                    tensor_value = torch.as_tensor(tensor_value)
-                prompt_tensors[tensor_name] = tensor_value
+            # prompt_tensors: dict[str, torch.Tensor] = {}
+            # for tensor_name in REMOTE_PROMPT_TENSOR_NAMES:
+            #     tensor_value = prompt.get(tensor_name)
+            #     if tensor_value is None:
+            #         raise RuntimeError(
+            #             f"Paused request_id={request_id} is missing prompt tensor '{tensor_name}'"
+            #         )
+            #     if not isinstance(tensor_value, torch.Tensor):
+            #         tensor_value = torch.as_tensor(tensor_value)
+            #     prompt_tensors[tensor_name] = tensor_value
 
-            for tensor_name, tensor in prompt_tensors.items():
-                store.put(self._mooncake_key(request_id, tensor_name), tensor)
+            # for tensor_name, tensor in prompt_tensors.items():
+            #     store.put(self._mooncake_key(request_id, tensor_name), tensor)
 
             generator_state = _serialize_generator_state(state.generator)
             if generator_state is None:
