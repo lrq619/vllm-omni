@@ -543,6 +543,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 noise_level = float(sp.extra_args.get("noise_level", 0.7))
                 sde_window_size = sp.extra_args.get("sde_window_size", None)
                 sde_window_range = sp.extra_args.get("sde_window_range", (0, 5))
+                sde_window_override = sp.extra_args.get("sde_window_override", None)
                 sde_type = str(sp.extra_args.get("sde_type", "sde"))
                 logprobs = bool(sp.extra_args.get("logprobs", True))
                 output_type = sp.output_type or "pil"
@@ -612,7 +613,62 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 else:
                     guidance = None
 
-                if sde_window_size is not None:
+                if sde_window_override is not None:
+                    if not isinstance(sde_window_override, (tuple, list)) or len(sde_window_override) != 2:
+                        logger.error(
+                            "Invalid sde_window_override format request_id=%s override=%r type=%s",
+                            request_id,
+                            sde_window_override,
+                            type(sde_window_override).__name__,
+                        )
+                        raise RuntimeError(
+                            f"Invalid sde_window_override for request_id={request_id}: "
+                            f"expected [start, end], got {sde_window_override!r}"
+                        )
+                    start_raw, end_raw = sde_window_override
+                    if any((not isinstance(x, int) or isinstance(x, bool)) for x in (start_raw, end_raw)):
+                        logger.error(
+                            "Invalid sde_window_override values request_id=%s override=%r "
+                            "(start/end must be int)",
+                            request_id,
+                            sde_window_override,
+                        )
+                        raise RuntimeError(
+                            f"Invalid sde_window_override for request_id={request_id}: "
+                            f"start/end must be int, got {sde_window_override!r}"
+                        )
+                    start = int(start_raw)
+                    end = int(end_raw)
+                    max_steps = len(timesteps)
+                    if end <= start:
+                        logger.error(
+                            "Invalid sde_window_override ordering request_id=%s start=%d end=%d",
+                            request_id,
+                            start,
+                            end,
+                        )
+                        raise RuntimeError(
+                            f"Invalid sde_window_override for request_id={request_id}: "
+                            f"end({end}) must be > start({start})"
+                        )
+                    if start < 0 or start >= max_steps or end > max_steps:
+                        logger.error(
+                            "Invalid sde_window_override range request_id=%s override=(%d, %d) "
+                            "valid_start=[0,%d] valid_end=[1,%d]",
+                            request_id,
+                            start,
+                            end,
+                            max_steps - 1,
+                            max_steps,
+                        )
+                        raise RuntimeError(
+                            f"Invalid sde_window_override for request_id={request_id}: "
+                            f"override=({start}, {end}) out of valid range with max_steps={max_steps} "
+                            "(end is exclusive)"
+                        )
+                    sde_window = (start, end)
+                    sde_window_source = "override"
+                elif sde_window_size is not None:
                     if not isinstance(sde_window_range, (tuple, list)) or len(sde_window_range) != 2:
                         logger.error("Invalid sde_window_range=%s for request_id=%s", sde_window_range, request_id)
                         raise RuntimeError(f"Invalid sde_window_range={sde_window_range} request_id={request_id}")
@@ -627,8 +683,18 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                     )
                     end = start + int(sde_window_size)
                     sde_window = (start, end)
+                    sde_window_source = "sampled"
                 else:
                     sde_window = (0, len(timesteps) - 1)
+                    sde_window_source = "sampled"
+
+                logger.info(
+                    "Stepwise request window selected request_id=%s source=%s sde_window=(%d, %d)",
+                    request_id,
+                    sde_window_source,
+                    sde_window[0],
+                    sde_window[1],
+                )
 
                 txt_seq_len = int(prompt_embeds_mask.sum(dim=1).item())
                 negative_txt_seq_len = int(negative_prompt_embeds_mask.sum(dim=1).item()) if do_true_cfg else None
@@ -827,6 +893,11 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 else:
                     cur_noise_level = 0.0
 
+                if step_index == state.sde_window[0]:
+                    # ROLL contract expects K+1 latents for a K-step SDE window:
+                    # one window-start latent + K step outputs.
+                    state.collected_latents.append(latents[i : i + 1].detach().clone())
+
                 next_latent, log_prob, _, _ = state.scheduler.step(
                     noise_pred[i : i + 1],
                     t,
@@ -983,29 +1054,51 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                         "No trajectory latents collected "
                         f"for request_id={request_id} at step_idx={state.step_idx}, sde_window={state.sde_window}"
                     )
-                if len(state.collected_timesteps) != len(state.collected_latents):
+                expected_k = int(state.sde_window[1] - state.sde_window[0])
+                if len(state.collected_timesteps) != expected_k:
                     logger.error(
-                        "Trajectory length mismatch request_id=%s latents=%d timesteps=%d",
+                        "Trajectory timestep length mismatch request_id=%s expected_k=%d timesteps=%d sde_window=%s",
                         request_id,
+                        expected_k,
+                        len(state.collected_timesteps),
+                        state.sde_window,
+                    )
+                    raise RuntimeError(
+                        "Trajectory timestep length mismatch "
+                        f"for request_id={request_id}: expected_k={expected_k} "
+                        f"timesteps={len(state.collected_timesteps)} sde_window={state.sde_window}"
+                    )
+                if len(state.collected_log_probs) != expected_k:
+                    logger.error(
+                        "Trajectory log_prob length mismatch request_id=%s expected_k=%d log_probs=%d sde_window=%s",
+                        request_id,
+                        expected_k,
+                        len(state.collected_log_probs),
+                        state.sde_window,
+                    )
+                    raise RuntimeError(
+                        "Trajectory log_prob length mismatch "
+                        f"for request_id={request_id}: expected_k={expected_k} "
+                        f"log_probs={len(state.collected_log_probs)} sde_window={state.sde_window}"
+                    )
+                if len(state.collected_latents) != expected_k + 1:
+                    logger.error(
+                        "Trajectory latent length mismatch request_id=%s expected=%d latents=%d "
+                        "timesteps=%d log_probs=%d sde_window=%s",
+                        request_id,
+                        expected_k + 1,
                         len(state.collected_latents),
                         len(state.collected_timesteps),
-                    )
-                    raise RuntimeError(
-                        "Trajectory length mismatch "
-                        f"for request_id={request_id}: latents={len(state.collected_latents)} "
-                        f"timesteps={len(state.collected_timesteps)}"
-                    )
-                if len(state.collected_log_probs) != len(state.collected_latents):
-                    logger.error(
-                        "Trajectory length mismatch request_id=%s latents=%d log_probs=%d",
-                        request_id,
-                        len(state.collected_latents),
                         len(state.collected_log_probs),
+                        state.sde_window,
                     )
                     raise RuntimeError(
-                        "Trajectory length mismatch "
-                        f"for request_id={request_id}: latents={len(state.collected_latents)} "
-                        f"log_probs={len(state.collected_log_probs)}"
+                        "Trajectory latent length mismatch "
+                        f"for request_id={request_id}: expected_latents={expected_k + 1} "
+                        f"latents={len(state.collected_latents)} "
+                        f"timesteps={len(state.collected_timesteps)} "
+                        f"log_probs={len(state.collected_log_probs)} "
+                        f"sde_window={state.sde_window}"
                     )
 
                 all_latents = torch.stack(state.collected_latents, dim=1)
