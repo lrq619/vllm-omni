@@ -687,6 +687,26 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             row_index = state.row_index
 
             payload = self._build_pause_state_payload(state)
+            prompt = state.request.prompts[0] if state.request.prompts else {}
+            if not isinstance(prompt, dict):
+                raise RuntimeError(
+                    f"Paused request_id={request_id} must have dict prompt payload for prompt tensor export."
+                )
+
+            prompt_tensors: dict[str, torch.Tensor] = {}
+            for tensor_name in REMOTE_PROMPT_TENSOR_NAMES:
+                tensor_value = prompt.get(tensor_name)
+                if tensor_value is None:
+                    raise RuntimeError(
+                        f"Paused request_id={request_id} is missing prompt tensor '{tensor_name}'"
+                    )
+                if not isinstance(tensor_value, torch.Tensor):
+                    tensor_value = torch.as_tensor(tensor_value)
+                prompt_tensors[tensor_name] = tensor_value
+
+            for tensor_name, tensor in prompt_tensors.items():
+                store.put(self._mooncake_key(request_id, tensor_name), tensor)
+
             generator_state = _serialize_generator_state(state.generator)
             if generator_state is None:
                 generator_state_values: list[torch.Tensor] = []
