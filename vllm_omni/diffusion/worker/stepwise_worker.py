@@ -572,7 +572,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
         )
 
         loaded_tensors: dict[str, Any] = {}
-        for tensor_name in list(dict.fromkeys(list(tensor_names) + list(tensor_pool_names))):
+        for tensor_name in list(tensor_pool_names):
             tensor_key = self._mooncake_key(request_id, str(tensor_name))
             tensor = store.get_tensor(tensor_key, device=self._pipeline().device)
             loaded_tensors[str(tensor_name)] = tensor
@@ -910,22 +910,22 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                     guidance = loaded_tensors.get("guidance")
                     if guidance is None and pipeline.transformer.guidance_embeds:
                         guidance = torch.full((1, 1), float(remote_state.get("guidance_scale", sp.guidance_scale)), dtype=torch.float32, device=pipeline.device)
-                    prompt_ids = loaded_tensors["prompt_ids"]
-                    prompt_mask = loaded_tensors["prompt_mask"]
-                    negative_prompt_ids = loaded_tensors["negative_prompt_ids"]
-                    negative_prompt_mask = loaded_tensors["negative_prompt_mask"]
+                    # prompt_ids = loaded_tensors["prompt_ids"]
+                    # prompt_mask = loaded_tensors["prompt_mask"]
+                    # negative_prompt_ids = loaded_tensors["negative_prompt_ids"]
+                    # negative_prompt_mask = loaded_tensors["negative_prompt_mask"]
                     pause_step_idx = None
-                    custom_prompt = dict(remote_state.get("prompt", {}))
-                    custom_prompt.update(
-                        {
-                            "prompt_ids": prompt_ids,
-                            "prompt_mask": prompt_mask,
-                            "negative_prompt_ids": negative_prompt_ids,
-                            "negative_prompt_mask": negative_prompt_mask,
-                        }
-                    )
-                    if request.prompts:
-                        request.prompts[0] = custom_prompt
+                    # custom_prompt = dict(remote_state.get("prompt", {}))
+                    # custom_prompt.update(
+                    #     {
+                    #         "prompt_ids": prompt_ids,
+                    #         "prompt_mask": prompt_mask,
+                    #         "negative_prompt_ids": negative_prompt_ids,
+                    #         "negative_prompt_mask": negative_prompt_mask,
+                    #     }
+                    # )
+                    # if request.prompts:
+                    #     request.prompts[0] = custom_prompt
                     collected_latents = _restore_tensor_list(remote_state.get("collected_latents", []), pipeline.device)
                     collected_log_probs = _restore_tensor_list(remote_state.get("collected_log_probs", []), pipeline.device)
                     collected_timesteps = _restore_tensor_list(remote_state.get("collected_timesteps", []), pipeline.device)
