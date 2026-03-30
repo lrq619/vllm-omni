@@ -29,6 +29,19 @@ from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 
 logger = init_logger(__name__)
 
+REMOTE_PROMPT_TENSOR_NAMES = (
+    "prompt_ids",
+    "prompt_mask",
+    "negative_prompt_ids",
+    "negative_prompt_mask",
+)
+PAUSE_STATE_TENSOR_FIELDS = (
+    "generator_state",
+    "collected_latents",
+    "collected_log_probs",
+    "collected_timesteps",
+)
+
 
 def _cuda_mem_mb(device: torch.device) -> tuple[float, float]:
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -214,8 +227,59 @@ def _restore_tensor_list(
         elif isinstance(value, torch.Tensor):
             restored.append(value.to(device))
         else:
-            restored.append(torch.as_tensor(value, device=device))
+            raise TypeError(f"Unsupported tensor list entry type: {type(value).__name__}")
     return restored
+
+
+def _pause_state_tensor_key(request_id: str, field_name: str, index: int | None = None) -> str:
+    if index is None:
+        return f"{request_id}::state::{field_name}"
+    return f"{request_id}::state::{field_name}::{index}"
+
+
+def _string_list(value: Any, *, request_id: str, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise RuntimeError(
+            f"Remote state payload for request_id={request_id} must contain list {field_name}."
+        )
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise RuntimeError(
+                f"Remote state payload for request_id={request_id} must contain string entries in {field_name}."
+            )
+        result.append(item)
+    return result
+
+
+def _optional_string_list(value: Any, *, request_id: str, field_name: str) -> list[str | None]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise RuntimeError(
+            f"Remote state payload for request_id={request_id} must contain list {field_name}."
+        )
+    result: list[str | None] = []
+    for item in value:
+        if item is None:
+            result.append(None)
+            continue
+        if not isinstance(item, str):
+            raise RuntimeError(
+                f"Remote state payload for request_id={request_id} must contain string or None entries in {field_name}."
+            )
+        result.append(item)
+    return result
+
+
+def _key_list_summary(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {"count": 0, "keys": []}
+    if not isinstance(value, list):
+        return {"type": type(value).__name__}
+    return {"count": len(value), "keys": list(value)}
 
 
 def _tensor_summary(value: Any) -> Any:
@@ -259,7 +323,11 @@ def _summarize_pause_state_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "collected_timesteps_count": payload.get("collected_timesteps_count"),
         "tensor_names": list(payload.get("tensor_names", [])),
         "tensor_pool_names": list(payload.get("tensor_pool_names", [])),
-        "generator_state": _tensor_summary(payload.get("generator_state")),
+        "generator_state_is_list": payload.get("generator_state_is_list"),
+        "generator_state_keys": _key_list_summary(payload.get("generator_state_keys")),
+        "collected_latents_keys": _key_list_summary(payload.get("collected_latents_keys")),
+        "collected_log_probs_keys": _key_list_summary(payload.get("collected_log_probs_keys")),
+        "collected_timesteps_keys": _key_list_summary(payload.get("collected_timesteps_keys")),
     }
 
 
@@ -290,7 +358,11 @@ def _summarize_remote_state_payload(state: dict[str, Any]) -> dict[str, Any]:
         "collected_timesteps_count": len(state.get("collected_timesteps", [])),
         "tensor_names": list(state.get("tensor_names", [])),
         "tensor_pool_names": list(state.get("tensor_pool_names", [])),
-        "generator_state": _tensor_summary(state.get("generator_state")),
+        "generator_state_is_list": state.get("generator_state_is_list"),
+        "generator_state_keys": _key_list_summary(state.get("generator_state_keys")),
+        "collected_latents_keys": _key_list_summary(state.get("collected_latents_keys")),
+        "collected_log_probs_keys": _key_list_summary(state.get("collected_log_probs_keys")),
+        "collected_timesteps_keys": _key_list_summary(state.get("collected_timesteps_keys")),
     }
 
 
@@ -399,6 +471,35 @@ class DiffusionStepwiseWorker(DiffusionWorker):
         if 0 <= state.step_idx < len(state.timesteps):
             current_timestep = float(state.timesteps[state.step_idx])
 
+        generator_state = _serialize_generator_state(state.generator)
+        if generator_state is None:
+            generator_state_keys: list[str] = []
+            generator_state_is_list = False
+        elif isinstance(generator_state, torch.Tensor):
+            generator_state_keys = [_pause_state_tensor_key(state.request_id, "generator_state")]
+            generator_state_is_list = False
+        else:
+            generator_state_keys = [
+                _pause_state_tensor_key(state.request_id, "generator_state", index)
+                for index in range(len(generator_state))
+            ]
+            generator_state_is_list = True
+
+        collected_latents_keys = [
+            _pause_state_tensor_key(state.request_id, "collected_latents", index)
+            for index in range(len(state.collected_latents))
+        ]
+        collected_log_probs_keys: list[str | None] = []
+        for index, value in enumerate(state.collected_log_probs):
+            if value is None:
+                collected_log_probs_keys.append(None)
+                continue
+            collected_log_probs_keys.append(_pause_state_tensor_key(state.request_id, "collected_log_probs", index))
+        collected_timesteps_keys = [
+            _pause_state_tensor_key(state.request_id, "collected_timesteps", index)
+            for index in range(len(state.collected_timesteps))
+        ]
+
         return {
             "version": 1,
             "request_id": state.request_id,
@@ -422,18 +523,14 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             "img_shapes": list(state.img_shapes),
             "txt_seq_len": state.txt_seq_len,
             "negative_txt_seq_len": state.negative_txt_seq_len,
-            "generator_state": _serialize_generator_state(state.generator),
-            "collected_latents": [_maybe_to_cpu(v) for v in state.collected_latents],
-            "collected_log_probs": [_maybe_to_cpu(v) if v is not None else None for v in state.collected_log_probs],
-            "collected_timesteps": [_maybe_to_cpu(v) for v in state.collected_timesteps],
             "prompt": self._strip_tensors_for_state(prompt),
-            "tensor_names": [
-                "prompt_ids",
-                "prompt_mask",
-                "negative_prompt_ids",
-                "negative_prompt_mask",
-            ],
+            "tensor_names": list(REMOTE_PROMPT_TENSOR_NAMES),
             "tensor_pool_names": list(self._ensure_runtime().pools.keys()),
+            "generator_state_is_list": generator_state_is_list,
+            "generator_state_keys": generator_state_keys,
+            "collected_latents_keys": collected_latents_keys,
+            "collected_log_probs_keys": collected_log_probs_keys,
+            "collected_timesteps_keys": collected_timesteps_keys,
             "collected_latents_count": len(state.collected_latents),
             "collected_log_probs_count": len(state.collected_log_probs),
             "collected_timesteps_count": len(state.collected_timesteps),
@@ -446,14 +543,8 @@ class DiffusionStepwiseWorker(DiffusionWorker):
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         store = self._ensure_mooncake_store()
         state_key = self._mooncake_key(request_id, "state")
-        payload = store.get(state_key, device="cpu")
-        if payload is None:
-            raise RuntimeError(f"Missing remote state payload for request_id={request_id}")
-        if not isinstance(payload, (bytes, bytearray, memoryview)):
-            raise RuntimeError(
-                f"Remote state payload for request_id={request_id} must be bytes, got {type(payload).__name__}"
-            )
-        state = pickle.loads(bytes(payload))
+        payload = store.get_bytes(state_key)
+        state = pickle.loads(payload)
         if not isinstance(state, dict):
             raise RuntimeError(f"Remote state payload for request_id={request_id} must decode to dict.")
 
@@ -465,26 +556,77 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 f"Remote state payload for request_id={request_id} must contain dict prompt payload."
             )
 
-        tensor_names = state.get("tensor_names", [])
-        if not isinstance(tensor_names, list):
+        tensor_names = _string_list(
+            state.get("tensor_names"),
+            request_id=request_id,
+            field_name="tensor_names",
+        )
+        if tensor_names != list(REMOTE_PROMPT_TENSOR_NAMES):
             raise RuntimeError(
-                f"Remote state payload for request_id={request_id} must contain list tensor_names."
+                f"Remote state payload for request_id={request_id} has unexpected tensor_names={tensor_names!r}"
             )
-        tensor_pool_names = state.get("tensor_pool_names", [])
-        if not isinstance(tensor_pool_names, list):
-            raise RuntimeError(
-                f"Remote state payload for request_id={request_id} must contain list tensor_pool_names."
-            )
+        tensor_pool_names = _string_list(
+            state.get("tensor_pool_names"),
+            request_id=request_id,
+            field_name="tensor_pool_names",
+        )
 
         loaded_tensors: dict[str, Any] = {}
         for tensor_name in list(dict.fromkeys(list(tensor_names) + list(tensor_pool_names))):
             tensor_key = self._mooncake_key(request_id, str(tensor_name))
-            tensor = store.get(tensor_key, device=self._pipeline().device)
-            if tensor is None:
-                raise RuntimeError(
-                    f"Missing remote tensor '{tensor_name}' for request_id={request_id}"
-                )
+            tensor = store.get_tensor(tensor_key, device=self._pipeline().device)
             loaded_tensors[str(tensor_name)] = tensor
+
+        generator_state_keys = _string_list(
+            state.get("generator_state_keys"),
+            request_id=request_id,
+            field_name="generator_state_keys",
+        )
+        generator_state_values = [
+            store.get_tensor(key, device=self._pipeline().device) for key in generator_state_keys
+        ]
+        if state.get("generator_state_is_list", False):
+            generator_state: torch.Tensor | list[torch.Tensor] | None = generator_state_values
+        else:
+            if len(generator_state_values) > 1:
+                raise RuntimeError(
+                    f"Remote state payload for request_id={request_id} marked generator_state as a single tensor "
+                    f"but contains {len(generator_state_values)} keys."
+                )
+            generator_state = generator_state_values[0] if generator_state_values else None
+
+        collected_latents_keys = _string_list(
+            state.get("collected_latents_keys"),
+            request_id=request_id,
+            field_name="collected_latents_keys",
+        )
+        collected_latents = [
+            store.get_tensor(key, device=self._pipeline().device) for key in collected_latents_keys
+        ]
+        collected_log_probs_keys = _optional_string_list(
+            state.get("collected_log_probs_keys"),
+            request_id=request_id,
+            field_name="collected_log_probs_keys",
+        )
+        collected_log_probs: list[torch.Tensor | None] = []
+        for key in collected_log_probs_keys:
+            if key is None:
+                collected_log_probs.append(None)
+                continue
+            collected_log_probs.append(store.get_tensor(key, device=self._pipeline().device))
+        collected_timesteps_keys = _string_list(
+            state.get("collected_timesteps_keys"),
+            request_id=request_id,
+            field_name="collected_timesteps_keys",
+        )
+        collected_timesteps = [
+            store.get_tensor(key, device=self._pipeline().device) for key in collected_timesteps_keys
+        ]
+
+        state["generator_state"] = generator_state
+        state["collected_latents"] = collected_latents
+        state["collected_log_probs"] = collected_log_probs
+        state["collected_timesteps"] = collected_timesteps
 
         logger.info(
             "Loaded remote prompt payload request_id=%s state=%s loaded_tensors=%s",
@@ -498,14 +640,8 @@ class DiffusionStepwiseWorker(DiffusionWorker):
     def _load_remote_state_payload(self, request_id: str) -> dict[str, Any]:
         store = self._ensure_mooncake_store()
         state_key = self._mooncake_key(request_id, "state")
-        payload = store.get(state_key, device="cpu")
-        if payload is None:
-            raise RuntimeError(f"Missing remote state payload for request_id={request_id}")
-        if not isinstance(payload, (bytes, bytearray, memoryview)):
-            raise RuntimeError(
-                f"Remote state payload for request_id={request_id} must be bytes, got {type(payload).__name__}"
-            )
-        state = pickle.loads(bytes(payload))
+        payload = store.get_bytes(state_key)
+        state = pickle.loads(payload)
         if not isinstance(state, dict):
             raise RuntimeError(f"Remote state payload for request_id={request_id} must decode to dict.")
         logger.info(
@@ -551,6 +687,36 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             row_index = state.row_index
 
             payload = self._build_pause_state_payload(state)
+            generator_state = _serialize_generator_state(state.generator)
+            if generator_state is None:
+                generator_state_values: list[torch.Tensor] = []
+            elif isinstance(generator_state, torch.Tensor):
+                generator_state_values = [generator_state]
+            else:
+                generator_state_values = list(generator_state)
+
+            for key, tensor in zip(payload["generator_state_keys"], generator_state_values, strict=True):
+                store.put(key, tensor)
+
+            for key, tensor in zip(payload["collected_latents_keys"], state.collected_latents, strict=True):
+                store.put(key, tensor)
+
+            for key, tensor in zip(payload["collected_log_probs_keys"], state.collected_log_probs, strict=True):
+                if key is None:
+                    if tensor is not None:
+                        raise RuntimeError(
+                            f"Paused request_id={request_id} has tensor log_prob value without a Mooncake key."
+                        )
+                    continue
+                if tensor is None:
+                    raise RuntimeError(
+                        f"Paused request_id={request_id} has Mooncake key for missing log_prob tensor."
+                    )
+                store.put(key, tensor)
+
+            for key, tensor in zip(payload["collected_timesteps_keys"], state.collected_timesteps, strict=True):
+                store.put(key, tensor)
+
             logger.info(
                 "Preparing paused request state for Mooncake request_id=%s payload=%s",
                 request_id,
@@ -571,6 +737,8 @@ class DiffusionStepwiseWorker(DiffusionWorker):
 
     def _ensure_pool(self, name: str, tensor: torch.Tensor) -> None:
         manager = self._ensure_runtime()
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"Pool '{name}' expects a torch.Tensor, got {type(tensor).__name__}")
         shape = tuple(tensor.shape[1:])
         dtype = tensor.dtype
         device = tensor.device

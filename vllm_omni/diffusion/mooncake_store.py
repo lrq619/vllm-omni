@@ -49,7 +49,6 @@ class MooncakeStore:
         self.segment_size_bytes = self.segment_size_gb * (1024**3)
         self.initialized = False
         self.storage_client = None
-        self._cached_keys: Dict[str, dict[str, Any]] = {}
         logger.info(
             "MooncakeStore initialized with storage=%s:%s master=%s:%s protocol=%s node=%s "
             "local_buffer_size=%s segment_size_gb=%s segment_size_bytes=%s",
@@ -88,7 +87,6 @@ class MooncakeStore:
                 try:
                     if os.environ.get("MOONCAKE_CLEAR_ON_INITIALIZE", "0") == "1":
                         self.storage_client.remove_all()
-                        self._cached_keys.clear()
                         time.sleep(3)
                         logger.info("MooncakeStore cleared existing keys on initialize.")
                 except Exception:
@@ -110,10 +108,9 @@ class MooncakeStore:
 
         if isinstance(data, (bytes, bytearray, memoryview)):
             payload = bytes(data)
-            self._cached_keys[key] = {"kind": "bytes", "size": len(payload)}
             result = self.storage_client.put(key, payload)
             if result != 0:
-                logger.error("Failed to store bytes payload '%s', error code: %s", key, result)
+                raise RuntimeError(f"Failed to store bytes payload '{key}', error code: {result}")
             return result
 
         tensor = data
@@ -126,59 +123,41 @@ class MooncakeStore:
             if pin_memory and not tensor.is_pinned():
                 cpu_tensor = cpu_tensor.pin_memory()
 
-        self._cached_keys[key] = {"kind": "tensor", "shape": tuple(tensor.shape), "dtype": tensor.dtype}
         result = self.storage_client.put_tensor(key, cpu_tensor)
         if result != 0:
-            logger.error("Failed to store tensor '%s', error code: %s", key, result)
+            raise RuntimeError(f"Failed to store tensor '{key}', error code: {result}")
         return result
 
-    def get(
+    def get_bytes(
+        self,
+        key: str,
+    ) -> bytes:
+        if not self.initialized:
+            raise RuntimeError("MooncakeStore not initialized. Call initialize() first.")
+
+        payload = self.storage_client.get(key)
+        if payload is None:
+            raise RuntimeError(f"Missing bytes payload '{key}'")
+        if isinstance(payload, bytes):
+            return payload
+        if isinstance(payload, bytearray):
+            return bytes(payload)
+        if isinstance(payload, memoryview):
+            return payload.tobytes()
+        raise RuntimeError(f"Expected bytes payload '{key}', got {type(payload).__name__}")
+
+    def get_tensor(
         self,
         key: str,
         device: Optional[Union[str, torch.device]] = None,
         non_blocking: bool = False,
-    ) -> bytes | Tensor | None:
+    ) -> Tensor:
         if not self.initialized:
             raise RuntimeError("MooncakeStore not initialized. Call initialize() first.")
 
-        entry = self._cached_keys.get(key)
-        if entry is not None and entry.get("kind") == "bytes":
-            payload = self.storage_client.get(key)
-            if payload is None:
-                return None
-            if isinstance(payload, bytes):
-                return payload
-            if isinstance(payload, bytearray):
-                return bytes(payload)
-            if isinstance(payload, memoryview):
-                return payload.tobytes()
-            return bytes(payload)
-
-        if entry is not None and entry.get("kind") == "tensor":
-            cpu_tensor = self.storage_client.get_tensor(key)
-            if cpu_tensor is None:
-                return None
-            if device is None:
-                device = torch.device("cpu")
-            if isinstance(device, str):
-                device = torch.device(device)
-            if device.type == "cpu":
-                return cpu_tensor
-            return cpu_tensor.to(device, non_blocking=non_blocking)
-
-        payload = self.storage_client.get(key)
-        if payload is not None:
-            if isinstance(payload, bytes):
-                return payload
-            if isinstance(payload, bytearray):
-                return bytes(payload)
-            if isinstance(payload, memoryview):
-                return payload.tobytes()
-            return bytes(payload)
-
         cpu_tensor = self.storage_client.get_tensor(key)
         if cpu_tensor is None:
-            return None
+            raise RuntimeError(f"Missing tensor payload '{key}'")
         if device is None:
             device = torch.device("cpu")
         if isinstance(device, str):
@@ -190,16 +169,9 @@ class MooncakeStore:
     def delete(self, key: str) -> int:
         if not self.initialized:
             raise RuntimeError("MooncakeStore not initialized. Call initialize() first.")
-        result = 0
-        if key in self._cached_keys:
-            result = self.storage_client.remove(key)
-            if result == -704:
-                logger.warning("Key '%s' is already removed during delete.", key)
-                del self._cached_keys[key]
-                result = 0
-            elif result == 0 or result == -706:
-                del self._cached_keys[key]
-                result = 0
+        result = self.storage_client.remove(key)
+        if result != 0 and result != -706:
+            raise RuntimeError(f"Failed to delete key '{key}', error code: {result}")
         return result
 
     def has_key(self, key: str) -> bool:
@@ -210,43 +182,19 @@ class MooncakeStore:
     def clear(self) -> None:
         if not self.initialized:
             return
-        for key in list(self._cached_keys.keys()):
-            result = self.storage_client.remove(key)
-            if result == -704:
-                logger.warning("Key '%s' is already removed during clear.", key)
-            elif result != 0 and result != -706:
-                logger.warning("Failed to remove key '%s' during clear, error code: %s", key, result)
-        self._cached_keys.clear()
+        result = self.storage_client.remove_all()
+        if result != 0:
+            raise RuntimeError(f"Failed to clear MooncakeStore, error code: {result}")
 
     def remove_all(self) -> None:
         if not self.initialized:
             return
-        self.storage_client.remove_all()
-        self._cached_keys.clear()
+        result = self.storage_client.remove_all()
+        if result != 0:
+            raise RuntimeError(f"Failed to remove all MooncakeStore keys, error code: {result}")
 
     def get_stats(self) -> Dict[str, Union[int, float]]:
-        if not self.initialized or self.storage_client is None:
-            return {}
-
-        total_size_bytes = 0
-        for entry in self._cached_keys.values():
-            if entry.get("kind") == "bytes":
-                total_size_bytes += int(entry.get("size", 0))
-            else:
-                shape = entry.get("shape", ())
-                dtype = entry.get("dtype")
-                if dtype is None:
-                    continue
-                numel = 1
-                for dim in shape:
-                    numel *= dim
-                total_size_bytes += numel * dtype.itemsize
-
-        return {
-            "num_keys": len(self._cached_keys),
-            "total_size_mb": total_size_bytes / 1024 / 1024,
-            "total_size_gb": total_size_bytes / 1024 / 1024 / 1024,
-        }
+        raise NotImplementedError("MooncakeStore.get_stats no longer tracks local key metadata.")
 
     def shutdown(self) -> None:
         if not self.initialized:
