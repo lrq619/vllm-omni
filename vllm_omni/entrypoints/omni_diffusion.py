@@ -187,7 +187,10 @@ class OmniDiffusion:
 
         for request_id, prompt, is_remote in zip(request_ids, prompts, is_remote_list, strict=True):
             if is_remote:
-                self._store_remote_request_payload(request_id=request_id, prompt=prompt)
+                logger.debug(
+                    "Skipping remote payload staging for request_id=%s because remote requests resume from Mooncake state.",
+                    request_id,
+                )
 
         request = OmniDiffusionRequest(prompts, sampling_params, request_ids=request_ids, is_remote_list=is_remote_list)
         return self._run_engine(request)

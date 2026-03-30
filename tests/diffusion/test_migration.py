@@ -171,6 +171,17 @@ def _write_request_result(
     return payload
 
 
+def _normalize_custom_output(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+    custom_output = normalized.get("custom_output")
+    if isinstance(custom_output, dict):
+        custom_output = dict(custom_output)
+        custom_output.pop("resume_from_step_idx", None)
+        custom_output.pop("executed_step_count", None)
+        normalized["custom_output"] = custom_output
+    return normalized
+
+
 def _write_single_stage_config(config_path: Path, device_idx: int) -> None:
     config_path.write_text(
         "\n".join(
@@ -363,6 +374,9 @@ async def _run_migration(tmp_path: Path) -> None:
             req0_id,
             paused_output.request_id,
         )
+        paused_custom_output = paused_output.custom_output or {}
+        paused_step_idx = paused_custom_output.get("step_idx")
+        paused_executed_step_count = paused_custom_output.get("executed_step_count")
 
         logger.info("[MigrationTrace] Launching remote replay request_id=%s", req0_id)
         remote_task = asyncio.create_task(
@@ -395,9 +409,28 @@ async def _run_migration(tmp_path: Path) -> None:
             req0_id,
             remote_output.request_id,
         )
+        remote_custom_output = remote_output.custom_output or {}
+        remote_resume_from_step_idx = remote_custom_output.get("resume_from_step_idx")
+        remote_executed_step_count = remote_custom_output.get("executed_step_count")
+        if remote_resume_from_step_idx != paused_step_idx:
+            raise RuntimeError(
+                f"Remote request resumed from unexpected step_idx for request_id={req0_id}: "
+                f"expected {paused_step_idx}, got {remote_resume_from_step_idx}"
+            )
+        expected_remote_steps = int(remote_custom_output.get("max_steps", 0)) - int(paused_step_idx)
+        if remote_executed_step_count != expected_remote_steps:
+            raise RuntimeError(
+                f"Remote request executed unexpected number of steps for request_id={req0_id}: "
+                f"expected {expected_remote_steps}, got {remote_executed_step_count}"
+            )
+        if paused_executed_step_count != paused_step_idx:
+            raise RuntimeError(
+                f"Paused request executed unexpected number of steps for request_id={req0_id}: "
+                f"expected {paused_step_idx}, got {paused_executed_step_count}"
+            )
 
-        normalized_baseline = dict(baseline_payload)
-        normalized_remote = dict(remote_payload)
+        normalized_baseline = _normalize_custom_output(dict(baseline_payload))
+        normalized_remote = _normalize_custom_output(dict(remote_payload))
         normalized_baseline.pop("request_id", None)
         normalized_baseline.pop("image_path", None)
         normalized_remote.pop("request_id", None)
@@ -528,6 +561,12 @@ async def _run_migration_with_pause_step_idx(tmp_path: Path) -> None:
                 f"Unexpected paused step_idx for request_id={req0_id}: "
                 f"expected {expected_paused_step_idx}, got {paused_step_idx}"
             )
+        paused_executed_step_count = paused_custom_output.get("executed_step_count")
+        if paused_executed_step_count != expected_paused_step_idx:
+            raise RuntimeError(
+                f"Unexpected paused executed_step_count for request_id={req0_id}: "
+                f"expected {expected_paused_step_idx}, got {paused_executed_step_count}"
+            )
         logger.info(
             "[MigrationTrace] Auto-paused task completed request_id=%s step_idx=%s",
             req0_id,
@@ -565,9 +604,23 @@ async def _run_migration_with_pause_step_idx(tmp_path: Path) -> None:
             req0_id,
             remote_output.request_id,
         )
+        remote_custom_output = remote_output.custom_output or {}
+        remote_resume_from_step_idx = remote_custom_output.get("resume_from_step_idx")
+        if remote_resume_from_step_idx != expected_paused_step_idx:
+            raise RuntimeError(
+                f"Remote request resumed from unexpected step_idx for request_id={req0_id}: "
+                f"expected {expected_paused_step_idx}, got {remote_resume_from_step_idx}"
+            )
+        remote_executed_step_count = remote_custom_output.get("executed_step_count")
+        expected_remote_steps = int(remote_custom_output.get("max_steps", 0)) - expected_paused_step_idx
+        if remote_executed_step_count != expected_remote_steps:
+            raise RuntimeError(
+                f"Remote request executed unexpected number of steps for request_id={req0_id}: "
+                f"expected {expected_remote_steps}, got {remote_executed_step_count}"
+            )
 
-        normalized_baseline = dict(baseline_payload)
-        normalized_remote = dict(remote_payload)
+        normalized_baseline = _normalize_custom_output(dict(baseline_payload))
+        normalized_remote = _normalize_custom_output(dict(remote_payload))
         normalized_baseline.pop("request_id", None)
         normalized_baseline.pop("image_path", None)
         normalized_remote.pop("request_id", None)

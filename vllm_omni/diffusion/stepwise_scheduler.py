@@ -26,6 +26,7 @@ class AdmissionResult:
     row_indices: list[int]
     max_steps: int
     current_timestep: float
+    step_idx: int = 0
     admitted: bool = True
     rejection_reason: str | None = None
 
@@ -425,6 +426,7 @@ class StepwiseScheduler:
                         state.status = "active"
                         state.row_indices = admission.row_indices
                         state.max_steps = admission.max_steps
+                        state.step_idx = admission.step_idx
                         state.current_timestep = admission.current_timestep
                         # Scheduler side metadata mirrors worker-side immutable controls.
                         sp = request.sampling_params

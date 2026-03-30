@@ -441,9 +441,6 @@ class AsyncOmni(OmniBase):
                 prompt_for_stage0 = dict(prompt)
                 prompt_for_stage0["pause_step_idx"] = pause_step_idx
 
-            if is_remote:
-                self._store_remote_request_payload(request_id=request_id, prompt=prompt_for_stage0)
-
             # Orchestrator keeps stage objects for input derivation
             num_stages = len(self.stage_list)
             # Track per-request start time for end-to-end timing

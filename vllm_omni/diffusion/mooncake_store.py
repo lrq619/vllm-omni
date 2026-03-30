@@ -86,9 +86,11 @@ class MooncakeStore:
             if status == 0:
                 self.initialized = True
                 try:
-                    self.storage_client.remove_all()
-                    self._cached_keys.clear()
-                    time.sleep(3)
+                    if os.environ.get("MOONCAKE_CLEAR_ON_INITIALIZE", "0") == "1":
+                        self.storage_client.remove_all()
+                        self._cached_keys.clear()
+                        time.sleep(3)
+                        logger.info("MooncakeStore cleared existing keys on initialize.")
                 except Exception:
                     pass
                 logger.info("MooncakeStore initialized successfully")
@@ -138,14 +140,34 @@ class MooncakeStore:
     ) -> bytes | Tensor | None:
         if not self.initialized:
             raise RuntimeError("MooncakeStore not initialized. Call initialize() first.")
-        if key not in self._cached_keys:
-            raise KeyError(f"Key '{key}' not found in MooncakeStore")
 
-        entry = self._cached_keys[key]
-        if entry.get("kind") == "bytes":
+        entry = self._cached_keys.get(key)
+        if entry is not None and entry.get("kind") == "bytes":
             payload = self.storage_client.get(key)
             if payload is None:
                 return None
+            if isinstance(payload, bytes):
+                return payload
+            if isinstance(payload, bytearray):
+                return bytes(payload)
+            if isinstance(payload, memoryview):
+                return payload.tobytes()
+            return bytes(payload)
+
+        if entry is not None and entry.get("kind") == "tensor":
+            cpu_tensor = self.storage_client.get_tensor(key)
+            if cpu_tensor is None:
+                return None
+            if device is None:
+                device = torch.device("cpu")
+            if isinstance(device, str):
+                device = torch.device(device)
+            if device.type == "cpu":
+                return cpu_tensor
+            return cpu_tensor.to(device, non_blocking=non_blocking)
+
+        payload = self.storage_client.get(key)
+        if payload is not None:
             if isinstance(payload, bytes):
                 return payload
             if isinstance(payload, bytearray):
