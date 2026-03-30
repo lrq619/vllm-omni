@@ -1494,7 +1494,12 @@ async def _stage_worker_async(
             if stage_type == "diffusion":
                 diffusion_sampling_params = cast(OmniDiffusionSamplingParams, task["sampling_params"])
                 # AsyncOmniDiffusion.generate returns a single result, not an async generator
-                gen_output = await cast(AsyncOmniDiffusion, stage_engine).generate(ein, diffusion_sampling_params, rid)
+                gen_output = await cast(AsyncOmniDiffusion, stage_engine).generate(
+                    ein,
+                    diffusion_sampling_params,
+                    rid,
+                    is_remote=bool(task.get("is_remote", False)),
+                )
                 _gen_t1 = _time.time()
                 _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
                 await generation_out_q.put((rid, gen_output, _gen_ms))
