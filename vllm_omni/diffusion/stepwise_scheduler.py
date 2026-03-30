@@ -303,7 +303,7 @@ class StepwiseScheduler:
                 "guidance": "guidance",
             },
         )
-        logger.info(
+        logger.debug(
             "Batch plan created plan_id=%s request_ids=%s rows=%s step_indices=%s",
             plan.plan_id,
             plan.request_ids,
