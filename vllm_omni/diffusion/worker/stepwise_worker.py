@@ -800,7 +800,10 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             if pipeline.transformer.guidance_embeds:
                 guidance = manager.get("guidance", row_indices).squeeze(-1)
 
-            timesteps = torch.tensor(plan.timesteps, dtype=latents.dtype, device=latents.device)
+            # Keep scheduler/trajectory timesteps in fp32 to match non-stepwise semantics.
+            timesteps = torch.tensor(plan.timesteps, dtype=torch.float32, device=latents.device)
+            # Transformer path follows latent dtype (bf16/fp16/fp32), matching non-stepwise behavior.
+            timesteps_model = timesteps.to(dtype=latents.dtype)
             if timesteps.ndim != 1 or timesteps.shape[0] != len(plan.request_ids):
                 raise RuntimeError(
                     f"Invalid plan.timesteps shape={tuple(timesteps.shape)} for batch={len(plan.request_ids)}."
@@ -821,7 +824,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             )
             transformer_kwargs = dict(
                 hidden_states=latents,
-                timestep=timesteps / 1000,
+                timestep=timesteps_model / 1000,
                 encoder_hidden_states_mask=prompt_embeds_mask,
                 encoder_hidden_states=prompt_embeds,
                 img_shapes=img_shapes,
@@ -855,7 +858,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
 
                 neg_transformer_kwargs = dict(
                     hidden_states=latents[idx_tensor],
-                    timestep=timesteps[idx_tensor] / 1000,
+                    timestep=timesteps_model[idx_tensor] / 1000,
                     encoder_hidden_states_mask=negative_prompt_embeds_mask[idx_tensor],
                     encoder_hidden_states=negative_prompt_embeds[idx_tensor],
                     img_shapes=neg_img_shapes,
@@ -884,7 +887,8 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             for i, req_id in enumerate(plan.request_ids):
                 state = self._states[req_id]
                 step_index = state.step_idx
-                t = torch.tensor(state.timesteps[step_index], dtype=latents.dtype, device=latents.device)
+                # Scheduler and exported all_timesteps keep fp32 precision.
+                t = torch.tensor(state.timesteps[step_index], dtype=torch.float32, device=latents.device)
 
                 if step_index < state.sde_window[0]:
                     cur_noise_level = 0.0
