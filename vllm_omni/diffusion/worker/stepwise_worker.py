@@ -218,6 +218,82 @@ def _restore_tensor_list(
     return restored
 
 
+def _tensor_summary(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return {
+            "shape": tuple(value.shape),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+        }
+    return {
+        "type": type(value).__name__,
+    }
+
+
+def _summarize_pause_state_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": payload.get("request_id"),
+        "row_index": payload.get("row_index"),
+        "step_idx": payload.get("step_idx"),
+        "max_steps": payload.get("max_steps"),
+        "pause_step_idx": payload.get("pause_step_idx"),
+        "executed_step_count": payload.get("executed_step_count"),
+        "current_timestep": payload.get("current_timestep"),
+        "timesteps_len": len(payload.get("timesteps", [])),
+        "do_true_cfg": payload.get("do_true_cfg"),
+        "true_cfg_scale": payload.get("true_cfg_scale"),
+        "noise_level": payload.get("noise_level"),
+        "sde_window": payload.get("sde_window"),
+        "sde_type": payload.get("sde_type"),
+        "logprobs": payload.get("logprobs"),
+        "guidance_scale": payload.get("guidance_scale"),
+        "output_type": payload.get("output_type"),
+        "height": payload.get("height"),
+        "width": payload.get("width"),
+        "txt_seq_len": payload.get("txt_seq_len"),
+        "negative_txt_seq_len": payload.get("negative_txt_seq_len"),
+        "collected_latents_count": payload.get("collected_latents_count"),
+        "collected_log_probs_count": payload.get("collected_log_probs_count"),
+        "collected_timesteps_count": payload.get("collected_timesteps_count"),
+        "tensor_names": list(payload.get("tensor_names", [])),
+        "tensor_pool_names": list(payload.get("tensor_pool_names", [])),
+        "generator_state": _tensor_summary(payload.get("generator_state")),
+    }
+
+
+def _summarize_remote_state_payload(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": state.get("request_id"),
+        "row_index": state.get("row_index"),
+        "step_idx": state.get("step_idx"),
+        "max_steps": state.get("max_steps"),
+        "pause_step_idx": state.get("pause_step_idx"),
+        "executed_step_count": state.get("executed_step_count"),
+        "current_timestep": state.get("current_timestep"),
+        "timesteps_len": len(state.get("timesteps", [])),
+        "do_true_cfg": state.get("do_true_cfg"),
+        "true_cfg_scale": state.get("true_cfg_scale"),
+        "noise_level": state.get("noise_level"),
+        "sde_window": state.get("sde_window"),
+        "sde_type": state.get("sde_type"),
+        "logprobs": state.get("logprobs"),
+        "guidance_scale": state.get("guidance_scale"),
+        "output_type": state.get("output_type"),
+        "height": state.get("height"),
+        "width": state.get("width"),
+        "txt_seq_len": state.get("txt_seq_len"),
+        "negative_txt_seq_len": state.get("negative_txt_seq_len"),
+        "collected_latents_count": len(state.get("collected_latents", [])),
+        "collected_log_probs_count": len(state.get("collected_log_probs", [])),
+        "collected_timesteps_count": len(state.get("collected_timesteps", [])),
+        "tensor_names": list(state.get("tensor_names", [])),
+        "tensor_pool_names": list(state.get("tensor_pool_names", [])),
+        "generator_state": _tensor_summary(state.get("generator_state")),
+    }
+
+
 class DiffusionStepwiseWorker(DiffusionWorker):
     """
     Worker-side runtime for one-step denoise execution.
@@ -410,6 +486,13 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 )
             loaded_tensors[str(tensor_name)] = tensor
 
+        logger.info(
+            "Loaded remote prompt payload request_id=%s state=%s loaded_tensors=%s",
+            request_id,
+            _summarize_remote_state_payload(state),
+            {name: _tensor_summary(tensor) for name, tensor in loaded_tensors.items()},
+        )
+
         return state, loaded_tensors
 
     def _load_remote_state_payload(self, request_id: str) -> dict[str, Any]:
@@ -425,6 +508,11 @@ class DiffusionStepwiseWorker(DiffusionWorker):
         state = pickle.loads(bytes(payload))
         if not isinstance(state, dict):
             raise RuntimeError(f"Remote state payload for request_id={request_id} must decode to dict.")
+        logger.info(
+            "Loaded remote state payload request_id=%s state=%s",
+            request_id,
+            _summarize_remote_state_payload(state),
+        )
         return state
 
     def stepwise_pause_requests(self, request_ids: list[str]) -> dict[str, Any]:
@@ -463,6 +551,11 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             row_index = state.row_index
 
             payload = self._build_pause_state_payload(state)
+            logger.info(
+                "Preparing paused request state for Mooncake request_id=%s payload=%s",
+                request_id,
+                _summarize_pause_state_payload(payload),
+            )
             store.put(self._mooncake_key(request_id, "state"), pickle.dumps(payload))
 
             for pool_name in pool_names:
