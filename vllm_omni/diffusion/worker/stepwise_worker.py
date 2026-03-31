@@ -79,6 +79,7 @@ class WorkerRequestState:
     collected_latents: list[torch.Tensor] = field(default_factory=list)
     collected_log_probs: list[torch.Tensor | None] = field(default_factory=list)
     collected_timesteps: list[torch.Tensor] = field(default_factory=list)
+    resume_from_step_idx: int = 0
 
 
 @dataclass
@@ -638,20 +639,6 @@ class DiffusionStepwiseWorker(DiffusionWorker):
 
         return state, loaded_tensors
 
-    def _load_remote_state_payload(self, request_id: str) -> dict[str, Any]:
-        store = self._ensure_mooncake_store()
-        state_key = self._mooncake_key(request_id, "state")
-        payload = store.get_bytes(state_key)
-        state = pickle.loads(payload)
-        if not isinstance(state, dict):
-            raise RuntimeError(f"Remote state payload for request_id={request_id} must decode to dict.")
-        logger.info(
-            "Loaded remote state payload request_id=%s state=%s",
-            request_id,
-            _summarize_remote_state_payload(state),
-        )
-        return state
-
     def stepwise_pause_requests(self, request_ids: list[str]) -> dict[str, Any]:
         if not isinstance(request_ids, list):
             raise TypeError(f"request_ids must be list[str], got {type(request_ids).__name__}")
@@ -1184,6 +1171,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                     collected_latents=collected_latents,
                     collected_log_probs=collected_log_probs,
                     collected_timesteps=collected_timesteps,
+                    resume_from_step_idx=resume_from_step_idx,
                 )
                 logger.info(
                     "Stepwise admission complete request_id=%s row=%d max_steps=%d resume_from_step_idx=%d first_t=%.6f pause_step_idx=%s",
@@ -1599,11 +1587,6 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 latents_unpacked = latents_unpacked / latents_std + latents_mean
                 image = pipeline.vae.decode(latents_unpacked, return_dict=False)[0][:, :, 0]
 
-            resume_from_step_idx = 0
-            if state.request.is_remote_list and bool(state.request.is_remote_list[0]):
-                remote_state = self._load_remote_state_payload(request_id)
-                resume_from_step_idx = int(remote_state.get("step_idx", 0))
-
             custom_output = {
                 "responses": _maybe_to_cpu(image),
                 "prompt_embeds": _maybe_to_cpu(prompt_embeds),
@@ -1612,8 +1595,8 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 "negative_prompt_embeds_mask": _maybe_to_cpu(negative_prompt_embeds_mask),
                 "finish_reason": finish_reason,
                 "step_idx": int(state.step_idx),
-                "resume_from_step_idx": int(resume_from_step_idx),
-                "executed_step_count": int(state.step_idx - resume_from_step_idx),
+                "resume_from_step_idx": int(state.resume_from_step_idx),
+                "executed_step_count": int(state.step_idx - state.resume_from_step_idx),
                 "max_steps": int(state.max_steps),
                 "pause_step_idx": state.pause_step_idx,
             }
