@@ -452,21 +452,6 @@ async def _run_migration(tmp_path: Path) -> None:
                 f"expected {paused_step_idx}, got {paused_executed_step_count}"
             )
 
-        baseline_trace = _load_latent_trace(out_root / "baseline" / "req_1" / "latents.json")
-        paused_trace = _load_latent_trace(out_root / "paused" / "req_0" / "latents.json")
-        remote_trace = _load_latent_trace(out_root / "remote" / "req_0" / "latents.json")
-        paused_divergence_step, paused_common_steps = _find_first_latent_divergence(paused_trace, remote_trace)
-        if paused_divergence_step is not None:
-            raise RuntimeError(
-                f"Paused and remote latent traces diverged at step_idx={paused_divergence_step}; "
-                f"common_steps={paused_common_steps}"
-            )
-        divergence_step, common_steps = _find_first_latent_divergence(baseline_trace, remote_trace)
-        if divergence_step is not None:
-            raise RuntimeError(
-                f"Latent traces diverged at step_idx={divergence_step}; common_steps={common_steps}"
-            )
-
         normalized_baseline = _normalize_custom_output(dict(baseline_payload))
         normalized_remote = _normalize_custom_output(dict(remote_payload))
         normalized_baseline.pop("request_id", None)
@@ -655,6 +640,21 @@ async def _run_migration_with_pause_step_idx(tmp_path: Path) -> None:
             raise RuntimeError(
                 f"Remote request executed unexpected number of steps for request_id={req0_id}: "
                 f"expected {expected_remote_steps}, got {remote_executed_step_count}"
+            )
+
+        baseline_trace = _load_latent_trace(out_root / "baseline" / "req_1" / "latents.json")
+        paused_trace = _load_latent_trace(out_root / "paused" / "req_0" / "latents.json")
+        remote_trace = _load_latent_trace(out_root / "remote" / "req_0" / "latents.json")
+        paused_divergence_step, paused_common_steps = _find_first_latent_divergence(paused_trace, remote_trace)
+        if paused_divergence_step is not None:
+            raise RuntimeError(
+                f"Paused and remote latent traces diverged at step_idx={paused_divergence_step}; "
+                f"common_steps={paused_common_steps}"
+            )
+        divergence_step, common_steps = _find_first_latent_divergence(baseline_trace, remote_trace)
+        if divergence_step is not None:
+            raise RuntimeError(
+                f"Latent traces diverged at step_idx={divergence_step}; common_steps={common_steps}"
             )
 
         normalized_baseline = _normalize_custom_output(dict(baseline_payload))
