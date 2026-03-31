@@ -234,6 +234,23 @@ def _restore_tensor_list(
     return restored
 
 
+def _serialize_sampling_params(sampling_params: Any) -> dict[str, Any]:
+    # Store the schedule-related request params needed to rebuild timesteps on resume.
+    return {
+        "num_inference_steps": int(getattr(sampling_params, "num_inference_steps", 0)),
+        "sigmas": copy.deepcopy(getattr(sampling_params, "sigmas", None)),
+        "seed": getattr(sampling_params, "seed", None),
+        "guidance_scale": getattr(sampling_params, "guidance_scale", None),
+        "guidance_scale_2": getattr(sampling_params, "guidance_scale_2", None),
+        "guidance_scale_provided": getattr(sampling_params, "guidance_scale_provided", None),
+        "true_cfg_scale": getattr(sampling_params, "true_cfg_scale", None),
+        "height": getattr(sampling_params, "height", None),
+        "width": getattr(sampling_params, "width", None),
+        "output_type": getattr(sampling_params, "output_type", None),
+        "extra_args": copy.deepcopy(getattr(sampling_params, "extra_args", {})),
+    }
+
+
 def _pause_state_tensor_key(request_id: str, field_name: str, index: int | None = None) -> str:
     if index is None:
         return f"{request_id}::state::{field_name}"
@@ -542,6 +559,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
             "img_shapes": list(state.img_shapes),
             "txt_seq_len": state.txt_seq_len,
             "negative_txt_seq_len": state.negative_txt_seq_len,
+            "sampling_params": _serialize_sampling_params(state.request.sampling_params),
             "prompt": self._strip_tensors_for_state(prompt),
             # "tensor_names": list(REMOTE_PROMPT_TENSOR_NAMES),
             "tensor_pool_names": list(self._ensure_runtime().pools.keys()),
@@ -917,25 +935,21 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                     guidance = loaded_tensors.get("guidance")
                     if guidance is None and pipeline.transformer.guidance_embeds:
                         guidance = torch.full((1, 1), float(remote_state.get("guidance_scale", sp.guidance_scale)), dtype=torch.float32, device=pipeline.device)
-                    # prompt_ids = loaded_tensors["prompt_ids"]
-                    # prompt_mask = loaded_tensors["prompt_mask"]
-                    # negative_prompt_ids = loaded_tensors["negative_prompt_ids"]
-                    # negative_prompt_mask = loaded_tensors["negative_prompt_mask"]
                     pause_step_idx = None
-                    # custom_prompt = dict(remote_state.get("prompt", {}))
-                    # custom_prompt.update(
-                    #     {
-                    #         "prompt_ids": prompt_ids,
-                    #         "prompt_mask": prompt_mask,
-                    #         "negative_prompt_ids": negative_prompt_ids,
-                    #         "negative_prompt_mask": negative_prompt_mask,
-                    #     }
-                    # )
-                    # if request.prompts:
-                    #     request.prompts[0] = custom_prompt
                     collected_latents = _restore_tensor_list(remote_state.get("collected_latents", []), pipeline.device)
                     collected_log_probs = _restore_tensor_list(remote_state.get("collected_log_probs", []), pipeline.device)
                     collected_timesteps = _restore_tensor_list(remote_state.get("collected_timesteps", []), pipeline.device)
+                    remote_sampling_params = remote_state.get("sampling_params", {})
+                    resume_num_inference_steps = int(
+                        remote_sampling_params.get("num_inference_steps", remote_state.get("max_steps", len(timesteps)))
+                    )
+                    resume_sigmas = remote_sampling_params.get("sigmas", sp.sigmas)
+                    timesteps, _ = pipeline.prepare_timesteps(
+                        resume_num_inference_steps,
+                        resume_sigmas,
+                        latents.shape[1],
+                    )
+                    timesteps = timesteps.detach().cpu().tolist()
                     req_scheduler = copy.deepcopy(pipeline.scheduler)
                     req_scheduler.set_begin_index(resume_from_step_idx)
                 else:
