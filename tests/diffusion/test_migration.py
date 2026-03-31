@@ -452,15 +452,6 @@ async def _run_migration(tmp_path: Path) -> None:
                 f"expected {paused_step_idx}, got {paused_executed_step_count}"
             )
 
-        normalized_baseline = _normalize_custom_output(dict(baseline_payload))
-        normalized_remote = _normalize_custom_output(dict(remote_payload))
-        normalized_baseline.pop("request_id", None)
-        normalized_baseline.pop("image_path", None)
-        normalized_remote.pop("request_id", None)
-        normalized_remote.pop("image_path", None)
-
-        assert normalized_baseline == normalized_remote, "Migrated output does not match baseline output."
-
         baseline_trace = _load_latent_trace(out_root / "baseline" / "req_1" / "latents.json")
         paused_trace = _load_latent_trace(out_root / "paused" / "req_0" / "latents.json")
         remote_trace = _load_latent_trace(out_root / "remote" / "req_0" / "latents.json")
@@ -475,6 +466,15 @@ async def _run_migration(tmp_path: Path) -> None:
             raise RuntimeError(
                 f"Latent traces diverged at step_idx={divergence_step}; common_steps={common_steps}"
             )
+
+        normalized_baseline = _normalize_custom_output(dict(baseline_payload))
+        normalized_remote = _normalize_custom_output(dict(remote_payload))
+        normalized_baseline.pop("request_id", None)
+        normalized_baseline.pop("image_path", None)
+        normalized_remote.pop("request_id", None)
+        normalized_remote.pop("image_path", None)
+
+        assert normalized_baseline == normalized_remote, "Migrated output does not match baseline output."
 
         baseline_img = Image.open(out_root / "baseline" / "req_1" / "output.png").convert("RGB")
         remote_img = Image.open(out_root / "remote" / "req_0" / "output.png").convert("RGB")
