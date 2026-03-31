@@ -891,16 +891,14 @@ async def _run_migration_with_pause_step_idx_stress(tmp_path: Path) -> None:
         pytest.skip("Set VLLM_OMNI_STEPWISE_TEST_MODEL to a valid stepwise-capable model path/name.")
 
     tokenizer = _load_tokenizer_from_model(model)
-    prompt_messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user", "content": _PROMPT_TEXT},
-    ]
     negative_prompt_messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": _NEG_PROMPT_TEXT},
     ]
-    prompt_ids, prompt_mask = _chat_template_to_ids(tokenizer, prompt_messages)
     negative_prompt_ids, negative_prompt_mask = _chat_template_to_ids(tokenizer, negative_prompt_messages)
+    prompt_variants = _make_prompt_variants(tokenizer)
+    if len(prompt_variants) != _STRESS_TEST_NUM_PAIRS:
+        raise RuntimeError(f"Expected {_STRESS_TEST_NUM_PAIRS} stress prompts, got {len(prompt_variants)}")
 
     sampling_params_template = _make_sampling_params()
     pause_step_indices = _make_pause_step_indices(
