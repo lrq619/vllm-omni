@@ -215,7 +215,7 @@ def _write_single_stage_config(config_path: Path, device_idx: int) -> None:
                 "    runtime:",
                 "      process: true",
                 f"      devices: \"{device_idx}\"",
-                "      max_batch_size: 1",
+                "      max_batch_size: 16",
                 "    engine_args:",
                 "      model_stage: diffusion",
                 "      enable_stepwise: true",
@@ -347,8 +347,12 @@ async def _run_migration(tmp_path: Path) -> None:
     _write_single_stage_config(config0, 0)
     _write_single_stage_config(config1, 1)
 
-    omni0 = _create_async_omni(model=model, config_path=config0)
-    omni1 = _create_async_omni(model=model, config_path=config1)
+    # Construct both AsyncOmni instances in parallel so the two GPU stages
+    # come up independently instead of serializing startup.
+    omni0, omni1 = await asyncio.gather(
+        asyncio.to_thread(_create_async_omni, model=model, config_path=config0),
+        asyncio.to_thread(_create_async_omni, model=model, config_path=config1),
+    )
 
     try:
         req0_id = "migration-req-0"
@@ -523,8 +527,12 @@ async def _run_migration_with_pause_step_idx(tmp_path: Path) -> None:
     _write_single_stage_config(config0, 0)
     _write_single_stage_config(config1, 1)
 
-    omni0 = _create_async_omni(model=model, config_path=config0)
-    omni1 = _create_async_omni(model=model, config_path=config1)
+    # Construct both AsyncOmni instances in parallel so the two GPU stages
+    # come up independently instead of serializing startup.
+    omni0, omni1 = await asyncio.gather(
+        asyncio.to_thread(_create_async_omni, model=model, config_path=config0),
+        asyncio.to_thread(_create_async_omni, model=model, config_path=config1),
+    )
 
     try:
         req0_id = "migration-req-pause-step-idx-0"
