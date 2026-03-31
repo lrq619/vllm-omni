@@ -863,22 +863,22 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                     raise RuntimeError(f"Expected one allocated row per request, got rows={row_indices}")
                 row_index = row_indices[0]
 
-                prompt_ids = custom_prompt.get("prompt_ids")
-                prompt_mask = custom_prompt.get("prompt_mask")
-                negative_prompt_ids = custom_prompt.get("negative_prompt_ids")
-                negative_prompt_mask = custom_prompt.get("negative_prompt_mask")
-                pause_step_idx_raw = custom_prompt.get("pause_step_idx")
-                if prompt_ids is None:
-                    logger.warning("Missing prompt_ids in request_id=%s", request_id)
-                    manager.release([row_index])
-                    return AdmissionResult(
-                        request_id=request_id,
-                        row_indices=[],
-                        max_steps=0,
-                        current_timestep=0.0,
-                        admitted=False,
-                        rejection_reason=f"Missing prompt_ids in request_id={request_id}",
-                    )
+                # prompt_ids = custom_prompt.get("prompt_ids")
+                # prompt_mask = custom_prompt.get("prompt_mask")
+                # negative_prompt_ids = custom_prompt.get("negative_prompt_ids")
+                # negative_prompt_mask = custom_prompt.get("negative_prompt_mask")
+                # pause_step_idx_raw = custom_prompt.get("pause_step_idx")
+                # if prompt_ids is None:
+                #     logger.warning("Missing prompt_ids in request_id=%s", request_id)
+                #     manager.release([row_index])
+                #     return AdmissionResult(
+                #         request_id=request_id,
+                #         row_indices=[],
+                #         max_steps=0,
+                #         current_timestep=0.0,
+                #         admitted=False,
+                #         rejection_reason=f"Missing prompt_ids in request_id={request_id}",
+                #     )
 
                 sp = request.sampling_params
                 height = sp.height or pipeline.default_sample_size * pipeline.vae_scale_factor
