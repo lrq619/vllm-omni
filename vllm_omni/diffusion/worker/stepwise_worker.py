@@ -335,7 +335,6 @@ def _latent_trace_summary(tensor: torch.Tensor) -> dict[str, Any]:
 def _summarize_pause_state_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "request_id": payload.get("request_id"),
-        "row_index": payload.get("row_index"),
         "step_idx": payload.get("step_idx"),
         "max_steps": payload.get("max_steps"),
         "pause_step_idx": payload.get("pause_step_idx"),
@@ -370,7 +369,6 @@ def _summarize_pause_state_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def _summarize_remote_state_payload(state: dict[str, Any]) -> dict[str, Any]:
     return {
         "request_id": state.get("request_id"),
-        "row_index": state.get("row_index"),
         "step_idx": state.get("step_idx"),
         "max_steps": state.get("max_steps"),
         "pause_step_idx": state.get("pause_step_idx"),
@@ -539,7 +537,6 @@ class DiffusionStepwiseWorker(DiffusionWorker):
         return {
             "version": 1,
             "request_id": state.request_id,
-            "row_index": state.row_index,
             "step_idx": state.step_idx,
             "max_steps": state.max_steps,
             "pause_step_idx": state.pause_step_idx,
@@ -860,16 +857,18 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                     if not isinstance(remote_prompt, dict):
                         logger.error("Remote state prompt payload must be a dict request_id=%s", request_id)
                         raise RuntimeError(f"Remote state prompt payload must be a dict request_id={request_id}")
-                    row_index = int(remote_state.get("row_index", -1))
-                    if row_index < 0:
-                        raise RuntimeError(f"Remote state payload for request_id={request_id} is missing row_index.")
-                    manager.reserve([row_index])
                     custom_prompt = dict(remote_prompt)
                     for tensor_name in remote_state.get("tensor_names", []):
                         custom_prompt[str(tensor_name)] = loaded_tensors[str(tensor_name)]
                     if request.prompts:
                         request.prompts[0] = custom_prompt
                     resume_from_step_idx = int(remote_state.get("step_idx", 0))
+                    # Row indices are worker-local; remote replay must claim a fresh row here.
+                    row_indices = manager.alloc(1)
+                    if len(row_indices) != 1:
+                        logger.error("Expected one allocated row per request, got rows=%s", row_indices)
+                        raise RuntimeError(f"Expected one allocated row per request, got rows={row_indices}")
+                    row_index = row_indices[0]
                 else:
                     row_indices = manager.alloc(1)
                     if len(row_indices) != 1:
