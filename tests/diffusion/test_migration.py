@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import shutil
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,9 @@ _APPLY_CHAT_TEMPLATE_KWARGS = {
     "padding": True,
     "truncation": True,
 }
+_STRESS_TEST_NUM_PAIRS = 32
+_STRESS_TEST_PAIR_INTERVAL_S = 1.0
+_STRESS_TEST_RANDOM_SEED = 20260331
 
 
 def _to_image_tensor(t: torch.Tensor) -> torch.Tensor:
@@ -185,6 +189,130 @@ def _normalize_custom_output(payload: dict[str, Any]) -> dict[str, Any]:
         custom_output.pop("latent_trace", None)
         normalized["custom_output"] = custom_output
     return normalized
+
+
+def _normalize_comparison_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+    normalized.pop("request_id", None)
+    normalized.pop("image_path", None)
+    normalized.pop("output_tensor", None)
+    return _normalize_custom_output(normalized)
+
+
+def _collect_differences(left: Any, right: Any, *, path: str = "", limit: int = 32) -> list[str]:
+    diffs: list[str] = []
+
+    def walk(lhs: Any, rhs: Any, cur_path: str) -> None:
+        if len(diffs) >= limit:
+            return
+        if type(lhs) is not type(rhs):
+            diffs.append(
+                f"{cur_path or '<root>'}: type mismatch {type(lhs).__name__} != {type(rhs).__name__}"
+            )
+            return
+        if isinstance(lhs, dict):
+            keys = sorted(set(lhs.keys()) | set(rhs.keys()), key=str)
+            for key in keys:
+                if len(diffs) >= limit:
+                    return
+                next_path = f"{cur_path}.{key}" if cur_path else str(key)
+                if key not in lhs:
+                    diffs.append(f"{next_path}: missing on left")
+                elif key not in rhs:
+                    diffs.append(f"{next_path}: missing on right")
+                else:
+                    walk(lhs[key], rhs[key], next_path)
+            return
+        if isinstance(lhs, list):
+            if len(lhs) != len(rhs):
+                diffs.append(f"{cur_path or '<root>'}: list length mismatch {len(lhs)} != {len(rhs)}")
+                if len(diffs) >= limit:
+                    return
+            for idx, (l_item, r_item) in enumerate(zip(lhs, rhs)):
+                if len(diffs) >= limit:
+                    return
+                walk(l_item, r_item, f"{cur_path}[{idx}]")
+            return
+        if isinstance(lhs, tuple):
+            if len(lhs) != len(rhs):
+                diffs.append(f"{cur_path or '<root>'}: tuple length mismatch {len(lhs)} != {len(rhs)}")
+                if len(diffs) >= limit:
+                    return
+            for idx, (l_item, r_item) in enumerate(zip(lhs, rhs)):
+                if len(diffs) >= limit:
+                    return
+                walk(l_item, r_item, f"{cur_path}({idx})")
+            return
+        if lhs != rhs:
+            diffs.append(f"{cur_path or '<root>'}: {lhs!r} != {rhs!r}")
+
+    walk(left, right, path)
+    return diffs
+
+
+def _compare_images(left: Image.Image, right: Image.Image) -> str | None:
+    left_np = np.array(left.convert("RGB"))
+    right_np = np.array(right.convert("RGB"))
+    if left_np.shape != right_np.shape:
+        return f"image shape mismatch: {left_np.shape} != {right_np.shape}"
+    if np.array_equal(left_np, right_np):
+        return None
+    diff_mask = left_np != right_np
+    differing_pixels = int(np.any(diff_mask, axis=-1).sum())
+    max_abs_diff = int(np.abs(left_np.astype(np.int16) - right_np.astype(np.int16)).max())
+    first_diff = np.argwhere(diff_mask)
+    if first_diff.size == 0:
+        return "image arrays differ but no differing pixel could be located"
+    y, x, channel = first_diff[0].tolist()
+    return (
+        "image mismatch: "
+        f"first_diff=(y={y}, x={x}, channel={channel}), "
+        f"left={int(left_np[y, x, channel])}, right={int(right_np[y, x, channel])}, "
+        f"differing_pixels={differing_pixels}, max_abs_diff={max_abs_diff}"
+    )
+
+
+def _copy_image(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
+
+def _write_pair_comparison(
+    pair_dir: Path,
+    *,
+    pair_index: int,
+    pause_step_idx: int,
+    baseline_payload_summary: dict[str, Any],
+    pause_migrate_payload_summary: dict[str, Any],
+    baseline_image_path: Path,
+    pause_migrate_image_path: Path,
+    mismatch_details: list[str] | None = None,
+) -> None:
+    _copy_image(baseline_image_path, pair_dir / "baseline.png")
+    _copy_image(pause_migrate_image_path, pair_dir / "pause_migrate.png")
+
+    comparison = {
+        "pair_index": pair_index,
+        "pause_step_idx": pause_step_idx,
+        "baseline_payload": baseline_payload_summary,
+        "pause_migrate_payload": pause_migrate_payload_summary,
+        "images_match": mismatch_details is None,
+        "mismatch_details": mismatch_details or [],
+    }
+    (pair_dir / "comparison.json").write_text(json.dumps(comparison, ensure_ascii=True), encoding="utf-8")
+
+
+def _make_pause_step_indices(*, num_inference_steps: int, num_pairs: int, seed: int) -> list[int]:
+    if num_inference_steps < 2:
+        raise ValueError(f"num_inference_steps must be >= 2, got {num_inference_steps}")
+    max_valid_pause_idx = num_inference_steps - 2
+    unique_values = max_valid_pause_idx + 1
+    if num_pairs > unique_values:
+        raise ValueError(
+            f"Cannot sample {num_pairs} unique pause_step_idx values from 0..{max_valid_pause_idx}"
+        )
+    rng = random.Random(seed)
+    return rng.sample(range(unique_values), num_pairs)
 
 
 def _load_latent_trace(path: Path) -> dict[str, Any]:
@@ -706,3 +834,241 @@ async def _run_migration_with_pause_step_idx(tmp_path: Path) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
 def test_migration_with_pause_step_idx(tmp_path: Path):
     asyncio.run(_run_migration_with_pause_step_idx(tmp_path))
+
+
+async def _run_migration_with_pause_step_idx_stress(tmp_path: Path) -> None:
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Requires at least 2 GPUs.")
+
+    model = os.getenv("VLLM_OMNI_STEPWISE_TEST_MODEL")
+    if not model:
+        pytest.skip("Set VLLM_OMNI_STEPWISE_TEST_MODEL to a valid stepwise-capable model path/name.")
+
+    tokenizer = _load_tokenizer_from_model(model)
+    prompt_messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": _PROMPT_TEXT},
+    ]
+    negative_prompt_messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": _NEG_PROMPT_TEXT},
+    ]
+    prompt_ids, prompt_mask = _chat_template_to_ids(tokenizer, prompt_messages)
+    negative_prompt_ids, negative_prompt_mask = _chat_template_to_ids(tokenizer, negative_prompt_messages)
+
+    sampling_params_template = _make_sampling_params()
+    pause_step_indices = _make_pause_step_indices(
+        num_inference_steps=int(sampling_params_template.num_inference_steps),
+        num_pairs=_STRESS_TEST_NUM_PAIRS,
+        seed=_STRESS_TEST_RANDOM_SEED,
+    )
+
+    out_root = Path("output/test_migration_pause_step_idx_stress")
+    if out_root.exists():
+        shutil.rmtree(out_root)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    config0 = tmp_path / "stage_gpu0_pause_step_idx_stress.yaml"
+    config1 = tmp_path / "stage_gpu1_pause_step_idx_stress.yaml"
+    _write_single_stage_config(config0, 0)
+    _write_single_stage_config(config1, 1)
+
+    omni0, omni1 = await asyncio.gather(
+        asyncio.to_thread(_create_async_omni, model=model, config_path=config0),
+        asyncio.to_thread(_create_async_omni, model=model, config_path=config1),
+    )
+
+    failures: list[dict[str, Any]] = []
+    try:
+        for pair_index, pause_step_idx in enumerate(pause_step_indices):
+            pair_dir = out_root / f"pair_{pair_index:03d}"
+            pair_dir.mkdir(parents=True, exist_ok=True)
+
+            baseline_request_id = f"migration-stress-{pair_index:03d}-baseline"
+            pause_request_id = f"migration-stress-{pair_index:03d}-pause"
+
+            logger.info(
+                "[MigrationTrace] Starting stress pair pair_index=%03d pause_step_idx=%d baseline_request_id=%s pause_request_id=%s",
+                pair_index,
+                pause_step_idx,
+                baseline_request_id,
+                pause_request_id,
+            )
+
+            baseline_task = asyncio.create_task(
+                _run_request(
+                    omni0,
+                    req_index=0,
+                    request_id=baseline_request_id,
+                    prompt_text=_PROMPT_TEXT,
+                    prompt_ids=prompt_ids,
+                    prompt_mask=prompt_mask,
+                    negative_prompt_ids=negative_prompt_ids,
+                    negative_prompt_mask=negative_prompt_mask,
+                    sampling_params=_make_sampling_params(),
+                    out_root=pair_dir / "baseline",
+                )
+            )
+            pause_task = asyncio.create_task(
+                _run_request(
+                    omni0,
+                    req_index=1,
+                    request_id=pause_request_id,
+                    prompt_text=_PROMPT_TEXT,
+                    prompt_ids=prompt_ids,
+                    prompt_mask=prompt_mask,
+                    negative_prompt_ids=negative_prompt_ids,
+                    negative_prompt_mask=negative_prompt_mask,
+                    sampling_params=_make_sampling_params(),
+                    out_root=pair_dir / "pause_migrate",
+                    pause_step_idx=pause_step_idx,
+                )
+            )
+
+            paused_output, paused_payload = await pause_task
+            paused_custom_output = paused_payload.get("custom_output")
+            if not isinstance(paused_custom_output, dict):
+                raise RuntimeError(
+                    f"Missing custom_output for paused request_id={pause_request_id}: {type(paused_custom_output).__name__}"
+                )
+            paused_finish_reason = paused_custom_output.get("finish_reason")
+            if paused_finish_reason != "paused":
+                raise RuntimeError(
+                    f"Expected paused finish_reason for request_id={pause_request_id}, got {paused_finish_reason!r}"
+                )
+            expected_paused_step_idx = pause_step_idx + 1
+            paused_step_idx = paused_custom_output.get("step_idx")
+            if paused_step_idx != expected_paused_step_idx:
+                raise RuntimeError(
+                    f"Unexpected paused step_idx for request_id={pause_request_id}: "
+                    f"expected {expected_paused_step_idx}, got {paused_step_idx}"
+                )
+            paused_executed_step_count = paused_custom_output.get("executed_step_count")
+            if paused_executed_step_count != expected_paused_step_idx:
+                raise RuntimeError(
+                    f"Unexpected paused executed_step_count for request_id={pause_request_id}: "
+                    f"expected {expected_paused_step_idx}, got {paused_executed_step_count}"
+                )
+
+            remote_task = asyncio.create_task(
+                _run_request(
+                    omni1,
+                    req_index=0,
+                    request_id=pause_request_id,
+                    prompt_text=_PROMPT_TEXT,
+                    prompt_ids=prompt_ids,
+                    prompt_mask=prompt_mask,
+                    negative_prompt_ids=negative_prompt_ids,
+                    negative_prompt_mask=negative_prompt_mask,
+                    sampling_params=_make_sampling_params(),
+                    out_root=pair_dir / "pause_migrate_remote",
+                    is_remote=True,
+                )
+            )
+
+            baseline_output, baseline_payload = await baseline_task
+            remote_output, remote_payload = await remote_task
+
+            remote_custom_output = remote_output.custom_output or {}
+            remote_resume_from_step_idx = remote_custom_output.get("resume_from_step_idx")
+            if remote_resume_from_step_idx != expected_paused_step_idx:
+                raise RuntimeError(
+                    f"Remote request resumed from unexpected step_idx for request_id={pause_request_id}: "
+                    f"expected {expected_paused_step_idx}, got {remote_resume_from_step_idx}"
+                )
+            remote_executed_step_count = remote_custom_output.get("executed_step_count")
+            expected_remote_steps = int(remote_custom_output.get("max_steps", 0)) - expected_paused_step_idx
+            if remote_executed_step_count != expected_remote_steps:
+                raise RuntimeError(
+                    f"Remote request executed unexpected number of steps for request_id={pause_request_id}: "
+                    f"expected {expected_remote_steps}, got {remote_executed_step_count}"
+                )
+
+            baseline_trace = _load_latent_trace(pair_dir / "baseline" / "req_0" / "latents.json")
+            remote_trace = _load_latent_trace(pair_dir / "pause_migrate_remote" / "req_0" / "latents.json")
+            divergence_step, common_steps = _find_first_latent_divergence(baseline_trace, remote_trace)
+
+            _, baseline_image = _extract_output_tensor_and_image(baseline_output)
+            _, remote_image = _extract_output_tensor_and_image(remote_output)
+
+            baseline_image_path = pair_dir / "baseline" / "req_0" / "output.png"
+            remote_image_path = pair_dir / "pause_migrate_remote" / "req_0" / "output.png"
+            image_diff = _compare_images(baseline_image, remote_image)
+
+            normalized_baseline = _normalize_comparison_payload(baseline_payload)
+            normalized_remote = _normalize_comparison_payload(remote_payload)
+            payload_diffs = _collect_differences(normalized_baseline, normalized_remote)
+
+            pair_mismatch_details: list[str] = []
+            if divergence_step is not None:
+                pair_mismatch_details.append(
+                    f"latent_trace diverged at step_idx={divergence_step}; common_steps={common_steps}"
+                )
+            if payload_diffs:
+                pair_mismatch_details.append("payload diff:\n" + "\n".join(f"  - {d}" for d in payload_diffs))
+            if image_diff is not None:
+                pair_mismatch_details.append(image_diff)
+
+            _write_pair_comparison(
+                pair_dir,
+                pair_index=pair_index,
+                pause_step_idx=pause_step_idx,
+                baseline_payload_summary=normalized_baseline,
+                pause_migrate_payload_summary=normalized_remote,
+                baseline_image_path=baseline_image_path,
+                pause_migrate_image_path=remote_image_path,
+                mismatch_details=pair_mismatch_details or None,
+            )
+
+            if pair_mismatch_details:
+                logger.error(
+                    "[MigrationTrace] Stress pair mismatch pair_index=%03d pause_step_idx=%d request_id=%s",
+                    pair_index,
+                    pause_step_idx,
+                    pause_request_id,
+                )
+                for detail in pair_mismatch_details:
+                    logger.error("[MigrationTrace]   %s", detail)
+                failures.append(
+                    {
+                        "pair_index": pair_index,
+                        "pause_step_idx": pause_step_idx,
+                        "request_id": pause_request_id,
+                        "details": pair_mismatch_details,
+                    }
+                )
+            else:
+                logger.info(
+                    "[MigrationTrace] Stress pair matched pair_index=%03d pause_step_idx=%d request_id=%s",
+                    pair_index,
+                    pause_step_idx,
+                    pause_request_id,
+                )
+
+            if pair_index < len(pause_step_indices) - 1:
+                await asyncio.sleep(_STRESS_TEST_PAIR_INTERVAL_S)
+
+        summary = {
+            "total_pairs": len(pause_step_indices),
+            "matched_pairs": len(pause_step_indices) - len(failures),
+            "failed_pairs": failures,
+            "pause_step_indices": pause_step_indices,
+        }
+        (out_root / "summary.json").write_text(json.dumps(summary, ensure_ascii=True), encoding="utf-8")
+        if failures:
+            raise AssertionError(
+                f"{len(failures)} stress pairs produced mismatched outputs; see output/test_migration_pause_step_idx_stress/summary.json"
+            )
+    except Exception:
+        logger.exception("[MigrationTrace] Migration stress flow with pause_step_idx failed before cleanup")
+        raise
+    finally:
+        logger.info("[MigrationTrace] Entering cleanup for migration pause_step_idx stress test")
+        omni0.close()
+        omni1.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
+@pytest.mark.slow
+def test_migration_with_pause_step_idx_stress(tmp_path: Path):
+    asyncio.run(_run_migration_with_pause_step_idx_stress(tmp_path))
