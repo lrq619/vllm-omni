@@ -405,10 +405,18 @@ class StepwiseScheduler:
                     if self._stop:
                         break
 
-                # Admit new requests while rows are available.
+                # Admit new requests only while capacity is available.
                 while True:
                     with self._cv:
                         if not self._pending:
+                            break
+                        if len(self._active) >= self._max_bsz:
+                            logger.debug(
+                                "StepwiseScheduler at capacity active=%d max_bsz=%d pending=%d",
+                                len(self._active),
+                                self._max_bsz,
+                                len(self._pending),
+                            )
                             break
                         request, state = self._pending.popleft()
                     try:

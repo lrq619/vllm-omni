@@ -227,3 +227,34 @@ def test_stepwise_scheduler_two_requests_batch_grows_to_two_midway():
         assert worker._states == {}
     finally:
         scheduler.close()
+
+
+def test_stepwise_scheduler_defers_pending_requests_when_at_capacity():
+    worker = MockStepwiseRPCWorker(per_step_sleep_s=0.05)
+    scheduler = _create_started_scheduler(worker, max_bsz=1)
+    req1 = _build_request("req-capacity-A", steps=4)
+    req2 = _build_request("req-capacity-B", steps=2)
+
+    try:
+        future_a = scheduler.add_req(req1)
+        _wait_until(lambda: len(worker.plan_history) >= 1, timeout_s=5.0)
+
+        future_b = scheduler.add_req(req2)
+        time.sleep(0.02)
+        assert worker.rpc_calls.count("stepwise_admit_request") == 1
+        assert len(scheduler._pending) == 1
+        assert len(scheduler._active) == 1
+
+        result_a = future_a.result(timeout=10)
+        result_b = future_b.result(timeout=10)
+
+        assert result_a is worker._final_outputs["req-capacity-A"]
+        assert result_b is worker._final_outputs["req-capacity-B"]
+        assert worker.rpc_calls.count("stepwise_admit_request") == 2
+        assert worker.rpc_calls.count("stepwise_execute_plan") == 6
+        assert [plan.request_ids for plan in worker.plan_history[:4]] == [["req-capacity-A"]] * 4
+        assert [plan.request_ids for plan in worker.plan_history[4:]] == [["req-capacity-B"]] * 2
+        assert scheduler._pending == deque()
+        assert scheduler._active == {}
+    finally:
+        scheduler.close()
