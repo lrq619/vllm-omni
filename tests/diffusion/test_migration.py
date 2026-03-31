@@ -122,6 +122,12 @@ def _normalize_token_ids(tokenized_output: Any) -> list[int]:
     return [int(x.item() if hasattr(x, "item") else x) for x in token_ids]
 
 
+def _normalize_mm_token_field(value: Any) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value.to(dtype=torch.long)
+    return torch.tensor(list(value), dtype=torch.long)
+
+
 def _chat_template_to_ids(tokenizer, messages):
     token_ids = tokenizer.apply_chat_template(
         messages,
@@ -449,10 +455,11 @@ async def _run_request(
         out_root,
     )
     final_output: OmniRequestOutput | None = None
+    prompt_ids_tensor = _normalize_mm_token_field(prompt_ids)
     try:
         async for out in omni.generate(
             prompt={
-                "prompt_ids": prompt_ids,
+                "prompt_ids": prompt_ids_tensor,
                 "prompt_mask": prompt_mask,
                 "negative_prompt_ids": negative_prompt_ids,
                 "negative_prompt_mask": negative_prompt_mask,
