@@ -124,7 +124,7 @@ class AsyncOmniDiffusion:
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 
         # Thread pool for running sync engine in async context
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._executor = ThreadPoolExecutor(max_workers=128)
         self._closed = False
 
         logger.info("AsyncOmniDiffusion initialized with model: %s", model)
