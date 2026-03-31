@@ -832,49 +832,36 @@ class DiffusionStepwiseWorker(DiffusionWorker):
         max_valid_len = int(valid_lens.max().item()) if valid_lens.numel() > 0 else 0
         return embeds[:, :max_valid_len, :], mask[:, :max_valid_len]
 
-    def stepwise_admit_request(self, request_id: str, request: OmniDiffusionRequest) -> AdmissionResult:
-        manager = self._ensure_runtime()
-        if request_id in self._states:
-            logger.error("Duplicate request admission request_id=%s", request_id)
-            raise RuntimeError(f"Duplicate request admission request_id={request_id}")
-        pipeline = self._pipeline()
+    def _stepwise_remote_admit_request(
+        self,
+        *,
+        request_id: str,
+        request: OmniDiffusionRequest,
+        manager: TensorPoolManager,
+        pipeline: QwenImagePipelineWithLogProbStep,
+    ) -> AdmissionResult:
         row_index = -1
-
         try:
             with torch.inference_mode():
-                custom_prompt = request.prompts[0] if request.prompts else {}
-                if not isinstance(custom_prompt, dict):
-                    logger.error("Stepwise admission expects dict prompt payload for Qwen step runtime.")
-                    raise RuntimeError("Stepwise admission expects dict prompt payload for Qwen step runtime.")
+                remote_state, loaded_tensors = self._load_remote_prompt_payload(request_id=request_id)
+                remote_prompt = remote_state.get("prompt", {})
+                if not isinstance(remote_prompt, dict):
+                    logger.error("Remote state prompt payload must be a dict request_id=%s", request_id)
+                    raise RuntimeError(f"Remote state prompt payload must be a dict request_id={request_id}")
 
-                is_remote_request = bool(request.is_remote_list[0]) if request.is_remote_list else False
-                remote_state: dict[str, Any] | None = None
-                loaded_tensors: dict[str, Any] = {}
-                resume_from_step_idx = 0
-                if is_remote_request:
-                    remote_state, loaded_tensors = self._load_remote_prompt_payload(request_id=request_id)
-                    remote_prompt = remote_state.get("prompt", {})
-                    if not isinstance(remote_prompt, dict):
-                        logger.error("Remote state prompt payload must be a dict request_id=%s", request_id)
-                        raise RuntimeError(f"Remote state prompt payload must be a dict request_id={request_id}")
-                    custom_prompt = dict(remote_prompt)
-                    for tensor_name in remote_state.get("tensor_names", []):
-                        custom_prompt[str(tensor_name)] = loaded_tensors[str(tensor_name)]
-                    if request.prompts:
-                        request.prompts[0] = custom_prompt
-                    resume_from_step_idx = int(remote_state.get("step_idx", 0))
-                    # Row indices are worker-local; remote replay must claim a fresh row here.
-                    row_indices = manager.alloc(1)
-                    if len(row_indices) != 1:
-                        logger.error("Expected one allocated row per request, got rows=%s", row_indices)
-                        raise RuntimeError(f"Expected one allocated row per request, got rows={row_indices}")
-                    row_index = row_indices[0]
-                else:
-                    row_indices = manager.alloc(1)
-                    if len(row_indices) != 1:
-                        logger.error("Expected one allocated row per request, got rows=%s", row_indices)
-                        raise RuntimeError(f"Expected one allocated row per request, got rows={row_indices}")
-                    row_index = row_indices[0]
+                custom_prompt = dict(remote_prompt)
+                for tensor_name in remote_state.get("tensor_names", []):
+                    custom_prompt[str(tensor_name)] = loaded_tensors[str(tensor_name)]
+                if request.prompts:
+                    request.prompts[0] = custom_prompt
+
+                resume_from_step_idx = int(remote_state.get("step_idx", 0))
+                # Row indices are worker-local; remote replay must claim a fresh row here.
+                row_indices = manager.alloc(1)
+                if len(row_indices) != 1:
+                    logger.error("Expected one allocated row per request, got rows=%s", row_indices)
+                    raise RuntimeError(f"Expected one allocated row per request, got rows={row_indices}")
+                row_index = row_indices[0]
 
                 prompt_ids = custom_prompt.get("prompt_ids")
                 prompt_mask = custom_prompt.get("prompt_mask")
@@ -897,270 +884,63 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 height = sp.height or pipeline.default_sample_size * pipeline.vae_scale_factor
                 width = sp.width or pipeline.default_sample_size * pipeline.vae_scale_factor
                 num_inference_steps = int(sp.num_inference_steps)
-                pause_step_idx: int | None = None
-                if is_remote_request:
-                    assert remote_state is not None
-                    timesteps = [float(t) for t in remote_state.get("timesteps", [])]
-                    if not timesteps:
-                        raise RuntimeError(f"Remote state payload for request_id={request_id} is missing timesteps.")
-                    resume_from_step_idx = int(remote_state.get("step_idx", 0))
-                    max_steps = int(remote_state.get("max_steps", len(timesteps)))
-                    if resume_from_step_idx < 0 or resume_from_step_idx >= max_steps:
-                        raise RuntimeError(
-                            f"Remote state payload for request_id={request_id} has invalid step_idx={resume_from_step_idx} "
-                            f"for max_steps={max_steps}"
-                        )
-                    do_true_cfg = bool(remote_state.get("do_true_cfg", False))
-                    true_cfg_scale = float(remote_state.get("true_cfg_scale", 4.0))
-                    noise_level = float(remote_state.get("noise_level", 0.7))
-                    sde_window = tuple(remote_state.get("sde_window", (0, max_steps - 1)))  # type: ignore[arg-type]
-                    sde_type = str(remote_state.get("sde_type", "sde"))
-                    logprobs = bool(remote_state.get("logprobs", True))
-                    output_type = str(remote_state.get("output_type", "pil"))
-                    height = int(remote_state.get("height", height))
-                    width = int(remote_state.get("width", width))
-                    img_shapes = [tuple(shape) for shape in remote_state.get("img_shapes", [])]
-                    txt_seq_len = int(remote_state.get("txt_seq_len", 0))
-                    negative_txt_seq_len = remote_state.get("negative_txt_seq_len", None)
-                    if negative_txt_seq_len is not None:
-                        negative_txt_seq_len = int(negative_txt_seq_len)
-                    generator = _restore_generator_state(remote_state.get("generator_state"), pipeline.device)
-                    prompt_embeds = loaded_tensors["prompt_embeds"]
-                    prompt_embeds_mask = loaded_tensors["prompt_embeds_mask"]
-                    negative_prompt_embeds = loaded_tensors["negative_prompt_embeds"]
-                    negative_prompt_embeds_mask = loaded_tensors["negative_prompt_embeds_mask"]
-                    latents = loaded_tensors["latents"]
-                    latent_trace = {str(resume_from_step_idx): _latent_trace_summary(latents)}
-                    guidance = loaded_tensors.get("guidance")
-                    if guidance is None and pipeline.transformer.guidance_embeds:
-                        guidance = torch.full((1, 1), float(remote_state.get("guidance_scale", sp.guidance_scale)), dtype=torch.float32, device=pipeline.device)
-                    pause_step_idx = None
-                    collected_latents = _restore_tensor_list(remote_state.get("collected_latents", []), pipeline.device)
-                    collected_log_probs = _restore_tensor_list(remote_state.get("collected_log_probs", []), pipeline.device)
-                    collected_timesteps = _restore_tensor_list(remote_state.get("collected_timesteps", []), pipeline.device)
-                    remote_sampling_params = remote_state.get("sampling_params", {})
-                    resume_num_inference_steps = int(
-                        remote_sampling_params.get("num_inference_steps", remote_state.get("max_steps", len(timesteps)))
+                assert remote_state is not None
+                timesteps = [float(t) for t in remote_state.get("timesteps", [])]
+                if not timesteps:
+                    raise RuntimeError(f"Remote state payload for request_id={request_id} is missing timesteps.")
+                resume_from_step_idx = int(remote_state.get("step_idx", 0))
+                max_steps = int(remote_state.get("max_steps", len(timesteps)))
+                if resume_from_step_idx < 0 or resume_from_step_idx >= max_steps:
+                    raise RuntimeError(
+                        f"Remote state payload for request_id={request_id} has invalid step_idx={resume_from_step_idx} "
+                        f"for max_steps={max_steps}"
                     )
-                    resume_sigmas = remote_sampling_params.get("sigmas", sp.sigmas)
-                    timesteps, _ = pipeline.prepare_timesteps(
-                        resume_num_inference_steps,
-                        resume_sigmas,
-                        latents.shape[1],
-                    )
-                    timesteps = timesteps.detach().cpu().tolist()
-                    req_scheduler = copy.deepcopy(pipeline.scheduler)
-                    req_scheduler.set_begin_index(resume_from_step_idx)
-                else:
-                    max_sequence_length = int(pipeline.tokenizer_max_length + pipeline.prompt_template_encode_start_idx)
-                    if sp.max_sequence_length is not None and int(sp.max_sequence_length) > max_sequence_length:
-                        logger.error(
-                            "Requested max_sequence_length=%s exceeds model limit=%d for request_id=%s",
-                            sp.max_sequence_length,
-                            max_sequence_length,
-                            request_id,
-                        )
-                        raise ValueError(
-                            f"Requested max_sequence_length={sp.max_sequence_length} exceeds model limit={max_sequence_length} "
-                            f"for request_id={request_id}"
-                        )
-                    if pause_step_idx_raw is not None:
-                        if isinstance(pause_step_idx_raw, bool) or not isinstance(pause_step_idx_raw, int):
-                            logger.error(
-                                "Invalid pause_step_idx request_id=%s value=%r type=%s",
-                                request_id,
-                                pause_step_idx_raw,
-                                type(pause_step_idx_raw).__name__,
-                            )
-                            raise RuntimeError(
-                                f"Invalid pause_step_idx for request_id={request_id}: {pause_step_idx_raw!r}"
-                            )
-                        if pause_step_idx_raw < 0:
-                            logger.error(
-                                "Invalid pause_step_idx request_id=%s value=%d (must be >= 0)",
-                                request_id,
-                                pause_step_idx_raw,
-                            )
-                            raise RuntimeError(
-                                f"Invalid pause_step_idx for request_id={request_id}: must be >= 0, got {pause_step_idx_raw}"
-                            )
-                        if pause_step_idx_raw >= num_inference_steps:
-                            logger.error(
-                                "Invalid pause_step_idx request_id=%s pause_step_idx=%d num_inference_steps=%d",
-                                request_id,
-                                pause_step_idx_raw,
-                                num_inference_steps,
-                            )
-                            raise RuntimeError(
-                                f"Invalid pause_step_idx for request_id={request_id}: {pause_step_idx_raw} "
-                                f">= num_inference_steps({num_inference_steps})"
-                            )
-                        pause_step_idx = int(pause_step_idx_raw)
-
-                    true_cfg_scale = float(sp.true_cfg_scale or 4.0)
-                    noise_level = float(sp.extra_args.get("noise_level", 0.7))
-                    sde_window_size = sp.extra_args.get("sde_window_size", None)
-                    sde_window_range = sp.extra_args.get("sde_window_range", (0, 5))
-                    sde_window_override = sp.extra_args.get("sde_window_override", None)
-                    sde_type = str(sp.extra_args.get("sde_type", "sde"))
-                    logprobs = bool(sp.extra_args.get("logprobs", True))
-                    output_type = sp.output_type or "pil"
-
-                    generator = sp.generator
-                    if generator is None and sp.seed is not None:
-                        generator = torch.Generator(device=pipeline.device).manual_seed(sp.seed)
-
-                    if isinstance(prompt_ids, list):
-                        prompt_ids = torch.tensor(prompt_ids, device=pipeline.device)
-                    if prompt_mask is not None and isinstance(prompt_mask, list):
-                        prompt_mask = torch.tensor(prompt_mask, device=pipeline.device)
-                    if isinstance(negative_prompt_ids, list):
-                        negative_prompt_ids = torch.tensor(negative_prompt_ids, device=pipeline.device)
-                    if negative_prompt_mask is not None and isinstance(negative_prompt_mask, list):
-                        negative_prompt_mask = torch.tensor(negative_prompt_mask, device=pipeline.device)
-
-                    has_neg_prompt = negative_prompt_ids is not None
-                    do_true_cfg = bool(true_cfg_scale > 1 and has_neg_prompt)
-
-                    prompt_embeds, prompt_embeds_mask = pipeline.encode_prompt(
-                        prompt_ids=prompt_ids,
-                        attention_mask=prompt_mask,
-                        num_images_per_prompt=1,
-                        max_sequence_length=max_sequence_length,
-                    )
-                    prompt_embeds, prompt_embeds_mask = self._pad_prompt_to_len(
-                        prompt_embeds, prompt_embeds_mask, max_sequence_length
-                    )
-
-                    if do_true_cfg:
-                        negative_prompt_embeds, negative_prompt_embeds_mask = pipeline.encode_prompt(
-                            prompt_ids=negative_prompt_ids,
-                            attention_mask=negative_prompt_mask,
-                            num_images_per_prompt=1,
-                            max_sequence_length=max_sequence_length,
-                        )
-                        negative_prompt_embeds, negative_prompt_embeds_mask = self._pad_prompt_to_len(
-                            negative_prompt_embeds,
-                            negative_prompt_embeds_mask,
-                            max_sequence_length,
-                        )
-                    else:
-                        negative_prompt_embeds = torch.zeros_like(prompt_embeds)
-                        negative_prompt_embeds_mask = torch.zeros_like(prompt_embeds_mask)
-
-                    num_channels_latents = pipeline.transformer.in_channels // 4
-                    latents = pipeline.prepare_latents(
-                        batch_size=1,
-                        num_channels_latents=num_channels_latents,
-                        height=height,
-                        width=width,
-                        dtype=prompt_embeds.dtype,
+                do_true_cfg = bool(remote_state.get("do_true_cfg", False))
+                true_cfg_scale = float(remote_state.get("true_cfg_scale", 4.0))
+                noise_level = float(remote_state.get("noise_level", 0.7))
+                sde_window = tuple(remote_state.get("sde_window", (0, max_steps - 1)))  # type: ignore[arg-type]
+                sde_type = str(remote_state.get("sde_type", "sde"))
+                logprobs = bool(remote_state.get("logprobs", True))
+                output_type = str(remote_state.get("output_type", "pil"))
+                height = int(remote_state.get("height", height))
+                width = int(remote_state.get("width", width))
+                img_shapes = [tuple(shape) for shape in remote_state.get("img_shapes", [])]
+                txt_seq_len = int(remote_state.get("txt_seq_len", 0))
+                negative_txt_seq_len = remote_state.get("negative_txt_seq_len", None)
+                if negative_txt_seq_len is not None:
+                    negative_txt_seq_len = int(negative_txt_seq_len)
+                generator = _restore_generator_state(remote_state.get("generator_state"), pipeline.device)
+                prompt_embeds = loaded_tensors["prompt_embeds"]
+                prompt_embeds_mask = loaded_tensors["prompt_embeds_mask"]
+                negative_prompt_embeds = loaded_tensors["negative_prompt_embeds"]
+                negative_prompt_embeds_mask = loaded_tensors["negative_prompt_embeds_mask"]
+                latents = loaded_tensors["latents"]
+                latent_trace = {str(resume_from_step_idx): _latent_trace_summary(latents)}
+                guidance = loaded_tensors.get("guidance")
+                if guidance is None and pipeline.transformer.guidance_embeds:
+                    guidance = torch.full(
+                        (1, 1),
+                        float(remote_state.get("guidance_scale", sp.guidance_scale)),
+                        dtype=torch.float32,
                         device=pipeline.device,
-                        generator=generator,
-                        latents=sp.latents,
                     )
-
-                    timesteps, _ = pipeline.prepare_timesteps(num_inference_steps, sp.sigmas, latents.shape[1])
-                    timesteps = timesteps.detach().cpu().tolist()
-                    req_scheduler = copy.deepcopy(pipeline.scheduler)
-                    req_scheduler.set_begin_index(0)
-
-                    if pipeline.transformer.guidance_embeds:
-                        guidance = torch.full((1, 1), float(sp.guidance_scale), dtype=torch.float32, device=pipeline.device)
-                    else:
-                        guidance = None
-
-                    if sde_window_override is not None:
-                        if not isinstance(sde_window_override, (tuple, list)) or len(sde_window_override) != 2:
-                            logger.error(
-                                "Invalid sde_window_override format request_id=%s override=%r type=%s",
-                                request_id,
-                                sde_window_override,
-                                type(sde_window_override).__name__,
-                            )
-                            raise RuntimeError(
-                                f"Invalid sde_window_override for request_id={request_id}: "
-                                f"expected [start, end], got {sde_window_override!r}"
-                            )
-                        start_raw, end_raw = sde_window_override
-                        if any((not isinstance(x, int) or isinstance(x, bool)) for x in (start_raw, end_raw)):
-                            logger.error(
-                                "Invalid sde_window_override values request_id=%s override=%r "
-                                "(start/end must be int)",
-                                request_id,
-                                sde_window_override,
-                            )
-                            raise RuntimeError(
-                                f"Invalid sde_window_override for request_id={request_id}: "
-                                f"start/end must be int, got {sde_window_override!r}"
-                            )
-                        start = int(start_raw)
-                        end = int(end_raw)
-                        max_steps = len(timesteps)
-                        if end <= start:
-                            logger.error(
-                                "Invalid sde_window_override ordering request_id=%s start=%d end=%d",
-                                request_id,
-                                start,
-                                end,
-                            )
-                            raise RuntimeError(
-                                f"Invalid sde_window_override for request_id={request_id}: "
-                                f"end({end}) must be > start({start})"
-                            )
-                        if start < 0 or start >= max_steps or end > max_steps:
-                            logger.error(
-                                "Invalid sde_window_override range request_id=%s override=(%d, %d) "
-                                "valid_start=[0,%d] valid_end=[1,%d]",
-                                request_id,
-                                start,
-                                end,
-                                max_steps - 1,
-                                max_steps,
-                            )
-                            raise RuntimeError(
-                                f"Invalid sde_window_override for request_id={request_id}: "
-                                f"override=({start}, {end}) out of valid range with max_steps={max_steps} "
-                                "(end is exclusive)"
-                            )
-                        sde_window = (start, end)
-                        sde_window_source = "override"
-                    elif sde_window_size is not None:
-                        if not isinstance(sde_window_range, (tuple, list)) or len(sde_window_range) != 2:
-                            logger.error("Invalid sde_window_range=%s for request_id=%s", sde_window_range, request_id)
-                            raise RuntimeError(f"Invalid sde_window_range={sde_window_range} request_id={request_id}")
-                        start = int(
-                            torch.randint(
-                                int(sde_window_range[0]),
-                                int(sde_window_range[1]) - int(sde_window_size) + 1,
-                                (1,),
-                                generator=generator,
-                                device=pipeline.device,
-                            ).item()
-                        )
-                        end = start + int(sde_window_size)
-                        sde_window = (start, end)
-                        sde_window_source = "sampled"
-                    else:
-                        sde_window = (0, len(timesteps) - 1)
-                        sde_window_source = "sampled"
-
-                    logger.info(
-                        "Stepwise request window selected request_id=%s source=%s sde_window=(%d, %d)",
-                        request_id,
-                        sde_window_source,
-                        sde_window[0],
-                        sde_window[1],
-                    )
-
-                    txt_seq_len = int(prompt_embeds_mask.sum(dim=1).item())
-                    negative_txt_seq_len = int(negative_prompt_embeds_mask.sum(dim=1).item()) if do_true_cfg else None
-                    img_shapes = [(1, height // pipeline.vae_scale_factor // 2, width // pipeline.vae_scale_factor // 2)]
-                    collected_latents = []
-                    collected_log_probs = []
-                    collected_timesteps = []
-                    resume_from_step_idx = 0
-                    latent_trace = {str(resume_from_step_idx): _latent_trace_summary(latents)}
+                pause_step_idx = None
+                collected_latents = _restore_tensor_list(remote_state.get("collected_latents", []), pipeline.device)
+                collected_log_probs = _restore_tensor_list(remote_state.get("collected_log_probs", []), pipeline.device)
+                collected_timesteps = _restore_tensor_list(remote_state.get("collected_timesteps", []), pipeline.device)
+                remote_sampling_params = remote_state.get("sampling_params", {})
+                resume_num_inference_steps = int(
+                    remote_sampling_params.get("num_inference_steps", remote_state.get("max_steps", len(timesteps)))
+                )
+                resume_sigmas = remote_sampling_params.get("sigmas", sp.sigmas)
+                timesteps, _ = pipeline.prepare_timesteps(
+                    resume_num_inference_steps,
+                    resume_sigmas,
+                    latents.shape[1],
+                )
+                timesteps = timesteps.detach().cpu().tolist()
+                req_scheduler = copy.deepcopy(pipeline.scheduler)
+                req_scheduler.set_begin_index(resume_from_step_idx)
 
                 self._ensure_pool("latents", latents)
                 self._ensure_pool("prompt_embeds", prompt_embeds)
@@ -1230,6 +1010,350 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 except Exception:
                     pass
             raise
+
+    def _stepwise_local_admit_request(
+        self,
+        *,
+        request_id: str,
+        request: OmniDiffusionRequest,
+        manager: TensorPoolManager,
+        pipeline: QwenImagePipelineWithLogProbStep,
+        custom_prompt: dict[str, Any],
+    ) -> AdmissionResult:
+        row_index = -1
+        try:
+            with torch.inference_mode():
+                row_indices = manager.alloc(1)
+                if len(row_indices) != 1:
+                    logger.error("Expected one allocated row per request, got rows=%s", row_indices)
+                    raise RuntimeError(f"Expected one allocated row per request, got rows={row_indices}")
+                row_index = row_indices[0]
+
+                prompt_ids = custom_prompt.get("prompt_ids")
+                prompt_mask = custom_prompt.get("prompt_mask")
+                negative_prompt_ids = custom_prompt.get("negative_prompt_ids")
+                negative_prompt_mask = custom_prompt.get("negative_prompt_mask")
+                pause_step_idx_raw = custom_prompt.get("pause_step_idx")
+                if prompt_ids is None:
+                    logger.warning("Missing prompt_ids in request_id=%s", request_id)
+                    manager.release([row_index])
+                    return AdmissionResult(
+                        request_id=request_id,
+                        row_indices=[],
+                        max_steps=0,
+                        current_timestep=0.0,
+                        admitted=False,
+                        rejection_reason=f"Missing prompt_ids in request_id={request_id}",
+                    )
+
+                sp = request.sampling_params
+                height = sp.height or pipeline.default_sample_size * pipeline.vae_scale_factor
+                width = sp.width or pipeline.default_sample_size * pipeline.vae_scale_factor
+                num_inference_steps = int(sp.num_inference_steps)
+                max_sequence_length = int(pipeline.tokenizer_max_length + pipeline.prompt_template_encode_start_idx)
+                if sp.max_sequence_length is not None and int(sp.max_sequence_length) > max_sequence_length:
+                    logger.error(
+                        "Requested max_sequence_length=%s exceeds model limit=%d for request_id=%s",
+                        sp.max_sequence_length,
+                        max_sequence_length,
+                        request_id,
+                    )
+                    raise ValueError(
+                        f"Requested max_sequence_length={sp.max_sequence_length} exceeds model limit={max_sequence_length} "
+                        f"for request_id={request_id}"
+                    )
+                if pause_step_idx_raw is not None:
+                    if isinstance(pause_step_idx_raw, bool) or not isinstance(pause_step_idx_raw, int):
+                        logger.error(
+                            "Invalid pause_step_idx request_id=%s value=%r type=%s",
+                            request_id,
+                            pause_step_idx_raw,
+                            type(pause_step_idx_raw).__name__,
+                        )
+                        raise RuntimeError(f"Invalid pause_step_idx for request_id={request_id}: {pause_step_idx_raw!r}")
+                    if pause_step_idx_raw < 0:
+                        logger.error(
+                            "Invalid pause_step_idx request_id=%s value=%d (must be >= 0)",
+                            request_id,
+                            pause_step_idx_raw,
+                        )
+                        raise RuntimeError(
+                            f"Invalid pause_step_idx for request_id={request_id}: must be >= 0, got {pause_step_idx_raw}"
+                        )
+                    if pause_step_idx_raw >= num_inference_steps:
+                        logger.error(
+                            "Invalid pause_step_idx request_id=%s pause_step_idx=%d num_inference_steps=%d",
+                            request_id,
+                            pause_step_idx_raw,
+                            num_inference_steps,
+                        )
+                        raise RuntimeError(
+                            f"Invalid pause_step_idx for request_id={request_id}: {pause_step_idx_raw} "
+                            f">= num_inference_steps({num_inference_steps})"
+                        )
+                    pause_step_idx = int(pause_step_idx_raw)
+                else:
+                    pause_step_idx = None
+
+                true_cfg_scale = float(sp.true_cfg_scale or 4.0)
+                noise_level = float(sp.extra_args.get("noise_level", 0.7))
+                sde_window_size = sp.extra_args.get("sde_window_size", None)
+                sde_window_range = sp.extra_args.get("sde_window_range", (0, 5))
+                sde_window_override = sp.extra_args.get("sde_window_override", None)
+                sde_type = str(sp.extra_args.get("sde_type", "sde"))
+                logprobs = bool(sp.extra_args.get("logprobs", True))
+                output_type = sp.output_type or "pil"
+
+                generator = sp.generator
+                if generator is None and sp.seed is not None:
+                    generator = torch.Generator(device=pipeline.device).manual_seed(sp.seed)
+
+                if isinstance(prompt_ids, list):
+                    prompt_ids = torch.tensor(prompt_ids, device=pipeline.device)
+                if prompt_mask is not None and isinstance(prompt_mask, list):
+                    prompt_mask = torch.tensor(prompt_mask, device=pipeline.device)
+                if isinstance(negative_prompt_ids, list):
+                    negative_prompt_ids = torch.tensor(negative_prompt_ids, device=pipeline.device)
+                if negative_prompt_mask is not None and isinstance(negative_prompt_mask, list):
+                    negative_prompt_mask = torch.tensor(negative_prompt_mask, device=pipeline.device)
+
+                has_neg_prompt = negative_prompt_ids is not None
+                do_true_cfg = bool(true_cfg_scale > 1 and has_neg_prompt)
+
+                prompt_embeds, prompt_embeds_mask = pipeline.encode_prompt(
+                    prompt_ids=prompt_ids,
+                    attention_mask=prompt_mask,
+                    num_images_per_prompt=1,
+                    max_sequence_length=max_sequence_length,
+                )
+                prompt_embeds, prompt_embeds_mask = self._pad_prompt_to_len(prompt_embeds, prompt_embeds_mask, max_sequence_length)
+
+                if do_true_cfg:
+                    negative_prompt_embeds, negative_prompt_embeds_mask = pipeline.encode_prompt(
+                        prompt_ids=negative_prompt_ids,
+                        attention_mask=negative_prompt_mask,
+                        num_images_per_prompt=1,
+                        max_sequence_length=max_sequence_length,
+                    )
+                    negative_prompt_embeds, negative_prompt_embeds_mask = self._pad_prompt_to_len(
+                        negative_prompt_embeds,
+                        negative_prompt_embeds_mask,
+                        max_sequence_length,
+                    )
+                else:
+                    negative_prompt_embeds = torch.zeros_like(prompt_embeds)
+                    negative_prompt_embeds_mask = torch.zeros_like(prompt_embeds_mask)
+
+                num_channels_latents = pipeline.transformer.in_channels // 4
+                latents = pipeline.prepare_latents(
+                    batch_size=1,
+                    num_channels_latents=num_channels_latents,
+                    height=height,
+                    width=width,
+                    dtype=prompt_embeds.dtype,
+                    device=pipeline.device,
+                    generator=generator,
+                    latents=sp.latents,
+                )
+
+                timesteps, _ = pipeline.prepare_timesteps(num_inference_steps, sp.sigmas, latents.shape[1])
+                timesteps = timesteps.detach().cpu().tolist()
+                req_scheduler = copy.deepcopy(pipeline.scheduler)
+                req_scheduler.set_begin_index(0)
+
+                if pipeline.transformer.guidance_embeds:
+                    guidance = torch.full((1, 1), float(sp.guidance_scale), dtype=torch.float32, device=pipeline.device)
+                else:
+                    guidance = None
+
+                if sde_window_override is not None:
+                    if not isinstance(sde_window_override, (tuple, list)) or len(sde_window_override) != 2:
+                        logger.error(
+                            "Invalid sde_window_override format request_id=%s override=%r type=%s",
+                            request_id,
+                            sde_window_override,
+                            type(sde_window_override).__name__,
+                        )
+                        raise RuntimeError(
+                            f"Invalid sde_window_override for request_id={request_id}: "
+                            f"expected [start, end], got {sde_window_override!r}"
+                        )
+                    start_raw, end_raw = sde_window_override
+                    if any((not isinstance(x, int) or isinstance(x, bool)) for x in (start_raw, end_raw)):
+                        logger.error(
+                            "Invalid sde_window_override values request_id=%s override=%r "
+                            "(start/end must be int)",
+                            request_id,
+                            sde_window_override,
+                        )
+                        raise RuntimeError(
+                            f"Invalid sde_window_override for request_id={request_id}: "
+                            f"start/end must be int, got {sde_window_override!r}"
+                        )
+                    start = int(start_raw)
+                    end = int(end_raw)
+                    max_steps = len(timesteps)
+                    if end <= start:
+                        logger.error(
+                            "Invalid sde_window_override ordering request_id=%s start=%d end=%d",
+                            request_id,
+                            start,
+                            end,
+                        )
+                        raise RuntimeError(
+                            f"Invalid sde_window_override for request_id={request_id}: "
+                            f"end({end}) must be > start({start})"
+                        )
+                    if start < 0 or start >= max_steps or end > max_steps:
+                        logger.error(
+                            "Invalid sde_window_override range request_id=%s override=(%d, %d) "
+                            "valid_start=[0,%d] valid_end=[1,%d]",
+                            request_id,
+                            start,
+                            end,
+                            max_steps - 1,
+                            max_steps,
+                        )
+                        raise RuntimeError(
+                            f"Invalid sde_window_override for request_id={request_id}: "
+                            f"override=({start}, {end}) out of valid range with max_steps={max_steps} "
+                            "(end is exclusive)"
+                        )
+                    sde_window = (start, end)
+                    sde_window_source = "override"
+                elif sde_window_size is not None:
+                    if not isinstance(sde_window_range, (tuple, list)) or len(sde_window_range) != 2:
+                        logger.error("Invalid sde_window_range=%s for request_id=%s", sde_window_range, request_id)
+                        raise RuntimeError(f"Invalid sde_window_range={sde_window_range} request_id={request_id}")
+                    start = int(
+                        torch.randint(
+                            int(sde_window_range[0]),
+                            int(sde_window_range[1]) - int(sde_window_size) + 1,
+                            (1,),
+                            generator=generator,
+                            device=pipeline.device,
+                        ).item()
+                    )
+                    end = start + int(sde_window_size)
+                    sde_window = (start, end)
+                    sde_window_source = "sampled"
+                else:
+                    sde_window = (0, len(timesteps) - 1)
+                    sde_window_source = "sampled"
+
+                logger.info(
+                    "Stepwise request window selected request_id=%s source=%s sde_window=(%d, %d)",
+                    request_id,
+                    sde_window_source,
+                    sde_window[0],
+                    sde_window[1],
+                )
+
+                txt_seq_len = int(prompt_embeds_mask.sum(dim=1).item())
+                negative_txt_seq_len = int(negative_prompt_embeds_mask.sum(dim=1).item()) if do_true_cfg else None
+                img_shapes = [(1, height // pipeline.vae_scale_factor // 2, width // pipeline.vae_scale_factor // 2)]
+                collected_latents = []
+                collected_log_probs = []
+                collected_timesteps = []
+                resume_from_step_idx = 0
+                latent_trace = {str(resume_from_step_idx): _latent_trace_summary(latents)}
+
+                self._ensure_pool("latents", latents)
+                self._ensure_pool("prompt_embeds", prompt_embeds)
+                self._ensure_pool("prompt_embeds_mask", prompt_embeds_mask)
+                self._ensure_pool("negative_prompt_embeds", negative_prompt_embeds)
+                self._ensure_pool("negative_prompt_embeds_mask", negative_prompt_embeds_mask)
+                if guidance is not None:
+                    self._ensure_pool("guidance", guidance)
+
+                manager.put("latents", [row_index], latents)
+                manager.put("prompt_embeds", [row_index], prompt_embeds)
+                manager.put("prompt_embeds_mask", [row_index], prompt_embeds_mask)
+                manager.put("negative_prompt_embeds", [row_index], negative_prompt_embeds)
+                manager.put("negative_prompt_embeds_mask", [row_index], negative_prompt_embeds_mask)
+                if guidance is not None:
+                    manager.put("guidance", [row_index], guidance)
+
+                self._states[request_id] = WorkerRequestState(
+                    request_id=request_id,
+                    row_index=row_index,
+                    timesteps=[float(t) for t in timesteps],
+                    step_idx=resume_from_step_idx,
+                    max_steps=len(timesteps),
+                    pause_step_idx=pause_step_idx,
+                    do_true_cfg=do_true_cfg,
+                    true_cfg_scale=true_cfg_scale,
+                    noise_level=noise_level,
+                    sde_window=sde_window,
+                    sde_type=sde_type,
+                    logprobs=logprobs,
+                    guidance_scale=float(sp.guidance_scale),
+                    output_type=output_type,
+                    height=height,
+                    width=width,
+                    img_shapes=img_shapes,
+                    txt_seq_len=txt_seq_len,
+                    negative_txt_seq_len=negative_txt_seq_len,
+                    generator=generator,
+                    request=request,
+                    scheduler=req_scheduler,
+                    collected_latents=collected_latents,
+                    collected_log_probs=collected_log_probs,
+                    collected_timesteps=collected_timesteps,
+                    resume_from_step_idx=resume_from_step_idx,
+                    latent_trace=latent_trace,
+                )
+                logger.info(
+                    "Stepwise admission complete request_id=%s row=%d max_steps=%d resume_from_step_idx=%d first_t=%.6f pause_step_idx=%s",
+                    request_id,
+                    row_index,
+                    len(timesteps),
+                    resume_from_step_idx,
+                    float(timesteps[resume_from_step_idx]),
+                    pause_step_idx,
+                )
+                return AdmissionResult(
+                    request_id=request_id,
+                    row_indices=[row_index],
+                    max_steps=len(timesteps),
+                    current_timestep=float(timesteps[resume_from_step_idx]),
+                    step_idx=resume_from_step_idx,
+                )
+        except Exception:
+            if row_index >= 0:
+                try:
+                    manager.release([row_index])
+                except Exception:
+                    pass
+            raise
+
+    def stepwise_admit_request(self, request_id: str, request: OmniDiffusionRequest) -> AdmissionResult:
+        manager = self._ensure_runtime()
+        if request_id in self._states:
+            logger.error("Duplicate request admission request_id=%s", request_id)
+            raise RuntimeError(f"Duplicate request admission request_id={request_id}")
+        pipeline = self._pipeline()
+        with torch.inference_mode():
+            custom_prompt = request.prompts[0] if request.prompts else {}
+            if not isinstance(custom_prompt, dict):
+                logger.error("Stepwise admission expects dict prompt payload for Qwen step runtime.")
+                raise RuntimeError("Stepwise admission expects dict prompt payload for Qwen step runtime.")
+
+            is_remote_request = bool(request.is_remote_list[0]) if request.is_remote_list else False
+            if is_remote_request:
+                return self._stepwise_remote_admit_request(
+                    request_id=request_id,
+                    request=request,
+                    manager=manager,
+                    pipeline=pipeline,
+                )
+            return self._stepwise_local_admit_request(
+                request_id=request_id,
+                request=request,
+                manager=manager,
+                pipeline=pipeline,
+                custom_prompt=custom_prompt,
+            )
 
     def stepwise_execute_plan(self, plan: SchedulerBatchPlan) -> StepExecutionResult:
         start_time = time.perf_counter()
