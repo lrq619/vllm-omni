@@ -42,6 +42,40 @@ _APPLY_CHAT_TEMPLATE_KWARGS = {
 _STRESS_TEST_NUM_PAIRS = 32
 _STRESS_TEST_PAIR_INTERVAL_S = 1.0
 _STRESS_TEST_RANDOM_SEED = 20260331
+_STRESS_TEST_PROMPTS = [
+    "A red apple on a white plate.",
+    "A blue car on a city street.",
+    "A yellow sunflower in a glass vase.",
+    "A white cat sleeping on a sofa.",
+    "A glass of lemonade with ice cubes.",
+    "A small red toy robot on a desk.",
+    "A bowl of strawberries on a table.",
+    "A brown dog sitting in a park.",
+    "A blue butterfly on a green leaf.",
+    "A stack of colorful books on a shelf.",
+    "A bowl of ramen with chopsticks.",
+    "A bright rainbow over a field.",
+    "A blue bicycle leaning against a wall.",
+    "A candle on a wooden table.",
+    "A pair of yellow rain boots by a door.",
+    "A silver watch on a black cloth.",
+    "A vase of pink flowers on a windowsill.",
+    "A hot air balloon in a clear sky.",
+    "A lighthouse by the ocean.",
+    "A slice of chocolate cake on a plate.",
+    "A green frog sitting on a lily pad.",
+    "A paper airplane on a desk.",
+    "A bowl of oranges on a kitchen counter.",
+    "A snowy cabin in the woods.",
+    "A red umbrella on a rainy sidewalk.",
+    "A potted cactus on a sunny windowsill.",
+    "A mountain lake at sunrise.",
+    "A pair of running shoes on the floor.",
+    "A wooden boat floating on calm water.",
+    "A blue teapot with steam rising.",
+    "A city skyline at sunset.",
+    "A striped beach ball on sand.",
+]
 
 
 def _to_image_tensor(t: torch.Tensor) -> torch.Tensor:
@@ -315,6 +349,18 @@ def _make_pause_step_indices(*, num_inference_steps: int, num_pairs: int, seed: 
     return rng.sample(range(unique_values), num_pairs)
 
 
+def _make_prompt_variants(tokenizer) -> list[tuple[str, list[int], list[int] | None]]:
+    variants: list[tuple[str, list[int], list[int] | None]] = []
+    for prompt_text in _STRESS_TEST_PROMPTS:
+        prompt_messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": prompt_text},
+        ]
+        prompt_ids, prompt_mask = _chat_template_to_ids(tokenizer, prompt_messages)
+        variants.append((prompt_text, prompt_ids, prompt_mask))
+    return variants
+
+
 def _load_latent_trace(path: Path) -> dict[str, Any]:
     trace = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(trace, dict):
@@ -454,16 +500,16 @@ async def _run_migration(tmp_path: Path) -> None:
         pytest.skip("Set VLLM_OMNI_STEPWISE_TEST_MODEL to a valid stepwise-capable model path/name.")
 
     tokenizer = _load_tokenizer_from_model(model)
-    prompt_messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user", "content": _PROMPT_TEXT},
-    ]
     negative_prompt_messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": _NEG_PROMPT_TEXT},
     ]
-    prompt_ids, prompt_mask = _chat_template_to_ids(tokenizer, prompt_messages)
     negative_prompt_ids, negative_prompt_mask = _chat_template_to_ids(tokenizer, negative_prompt_messages)
+    prompt_variants = _make_prompt_variants(tokenizer)
+    if len(prompt_variants) != _STRESS_TEST_NUM_PAIRS:
+        raise RuntimeError(
+            f"Expected {_STRESS_TEST_NUM_PAIRS} stress prompts, got {len(prompt_variants)}"
+        )
 
     out_root = Path("output/test_migration")
     if out_root.exists():
@@ -881,6 +927,7 @@ async def _run_migration_with_pause_step_idx_stress(tmp_path: Path) -> None:
     failures: list[dict[str, Any]] = []
     try:
         for pair_index, pause_step_idx in enumerate(pause_step_indices):
+            prompt_text, prompt_ids, prompt_mask = prompt_variants[pair_index]
             pair_dir = out_root / f"pair_{pair_index:03d}"
             pair_dir.mkdir(parents=True, exist_ok=True)
 
@@ -888,9 +935,10 @@ async def _run_migration_with_pause_step_idx_stress(tmp_path: Path) -> None:
             pause_request_id = f"migration-stress-{pair_index:03d}-pause"
 
             logger.info(
-                "[MigrationTrace] Starting stress pair pair_index=%03d pause_step_idx=%d baseline_request_id=%s pause_request_id=%s",
+                "[MigrationTrace] Starting stress pair pair_index=%03d pause_step_idx=%d prompt=%r baseline_request_id=%s pause_request_id=%s",
                 pair_index,
                 pause_step_idx,
+                prompt_text,
                 baseline_request_id,
                 pause_request_id,
             )
