@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import pickle
 import time
 from collections import deque
@@ -80,6 +81,7 @@ class WorkerRequestState:
     collected_log_probs: list[torch.Tensor | None] = field(default_factory=list)
     collected_timesteps: list[torch.Tensor] = field(default_factory=list)
     resume_from_step_idx: int = 0
+    latent_trace: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -294,6 +296,22 @@ def _tensor_summary(value: Any) -> Any:
         }
     return {
         "type": type(value).__name__,
+    }
+
+
+def _latent_trace_summary(tensor: torch.Tensor) -> dict[str, Any]:
+    cpu_tensor = tensor.detach().to(device="cpu").contiguous()
+    cpu_float = cpu_tensor.float()
+    flat = cpu_tensor.reshape(-1)
+    return {
+        "shape": list(cpu_tensor.shape),
+        "dtype": str(cpu_tensor.dtype),
+        "sha256": hashlib.sha256(cpu_float.numpy().tobytes()).hexdigest(),
+        "mean": float(cpu_float.mean().item()) if cpu_tensor.numel() > 0 else 0.0,
+        "std": float(cpu_float.std(unbiased=False).item()) if cpu_tensor.numel() > 0 else 0.0,
+        "min": float(cpu_float.min().item()) if cpu_tensor.numel() > 0 else 0.0,
+        "max": float(cpu_float.max().item()) if cpu_tensor.numel() > 0 else 0.0,
+        "sample": [float(x) for x in flat[:8].tolist()],
     }
 
 
@@ -895,6 +913,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                     negative_prompt_embeds = loaded_tensors["negative_prompt_embeds"]
                     negative_prompt_embeds_mask = loaded_tensors["negative_prompt_embeds_mask"]
                     latents = loaded_tensors["latents"]
+                    latent_trace = {str(resume_from_step_idx): _latent_trace_summary(latents)}
                     guidance = loaded_tensors.get("guidance")
                     if guidance is None and pipeline.transformer.guidance_embeds:
                         guidance = torch.full((1, 1), float(remote_state.get("guidance_scale", sp.guidance_scale)), dtype=torch.float32, device=pipeline.device)
@@ -1128,6 +1147,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                     collected_log_probs = []
                     collected_timesteps = []
                     resume_from_step_idx = 0
+                    latent_trace = {str(resume_from_step_idx): _latent_trace_summary(latents)}
 
                 self._ensure_pool("latents", latents)
                 self._ensure_pool("prompt_embeds", prompt_embeds)
@@ -1172,6 +1192,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                     collected_log_probs=collected_log_probs,
                     collected_timesteps=collected_timesteps,
                     resume_from_step_idx=resume_from_step_idx,
+                    latent_trace=latent_trace,
                 )
                 logger.info(
                     "Stepwise admission complete request_id=%s row=%d max_steps=%d resume_from_step_idx=%d first_t=%.6f pause_step_idx=%s",
@@ -1360,6 +1381,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 done = state.step_idx >= state.max_steps
                 finished.append(done)
                 next_step_indices.append(state.step_idx)
+                state.latent_trace[str(state.step_idx)] = _latent_trace_summary(next_latent)
                 if done:
                     next_timesteps.append(None)
                 else:
@@ -1599,6 +1621,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 "executed_step_count": int(state.step_idx - state.resume_from_step_idx),
                 "max_steps": int(state.max_steps),
                 "pause_step_idx": state.pause_step_idx,
+                "latent_trace": state.latent_trace,
             }
             if require_trajectory:
                 custom_output["all_latents"] = _maybe_to_cpu(all_latents)

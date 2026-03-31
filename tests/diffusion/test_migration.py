@@ -168,6 +168,10 @@ def _write_request_result(
         "custom_output": _serialize_obj(custom_output),
     }
     (req_dir / "result.json").write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+    latent_trace = {}
+    if isinstance(custom_output, dict):
+        latent_trace = custom_output.get("latent_trace") or {}
+    (req_dir / "latents.json").write_text(json.dumps(latent_trace, ensure_ascii=True), encoding="utf-8")
     return payload
 
 
@@ -178,8 +182,27 @@ def _normalize_custom_output(payload: dict[str, Any]) -> dict[str, Any]:
         custom_output = dict(custom_output)
         custom_output.pop("resume_from_step_idx", None)
         custom_output.pop("executed_step_count", None)
+        custom_output.pop("latent_trace", None)
         normalized["custom_output"] = custom_output
     return normalized
+
+
+def _load_latent_trace(path: Path) -> dict[str, Any]:
+    trace = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(trace, dict):
+        raise RuntimeError(f"Expected latent trace JSON object at {path}, got {type(trace).__name__}")
+    return trace
+
+
+def _find_first_latent_divergence(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> tuple[str | None, list[str]]:
+    common_steps = sorted(set(left.keys()) & set(right.keys()), key=lambda s: int(s))
+    for step in common_steps:
+        if left[step] != right[step]:
+            return step, common_steps
+    return None, common_steps
 
 
 def _write_single_stage_config(config_path: Path, device_idx: int) -> None:
@@ -438,6 +461,21 @@ async def _run_migration(tmp_path: Path) -> None:
 
         assert normalized_baseline == normalized_remote, "Migrated output does not match baseline output."
 
+        baseline_trace = _load_latent_trace(out_root / "baseline" / "req_1" / "latents.json")
+        paused_trace = _load_latent_trace(out_root / "paused" / "req_0" / "latents.json")
+        remote_trace = _load_latent_trace(out_root / "remote" / "req_0" / "latents.json")
+        paused_divergence_step, paused_common_steps = _find_first_latent_divergence(paused_trace, remote_trace)
+        if paused_divergence_step is not None:
+            raise RuntimeError(
+                f"Paused and remote latent traces diverged at step_idx={paused_divergence_step}; "
+                f"common_steps={paused_common_steps}"
+            )
+        divergence_step, common_steps = _find_first_latent_divergence(baseline_trace, remote_trace)
+        if divergence_step is not None:
+            raise RuntimeError(
+                f"Latent traces diverged at step_idx={divergence_step}; common_steps={common_steps}"
+            )
+
         baseline_img = Image.open(out_root / "baseline" / "req_1" / "output.png").convert("RGB")
         remote_img = Image.open(out_root / "remote" / "req_0" / "output.png").convert("RGB")
         assert np.array_equal(np.array(baseline_img), np.array(remote_img)), "Migrated image does not match baseline image."
@@ -638,6 +676,8 @@ async def _run_migration_with_pause_step_idx(tmp_path: Path) -> None:
             "remote_request_id": req0_id,
             "baseline_vs_remote_equal": True,
             "pause_step_idx": pause_step_idx,
+            "paused_remote_common_steps": list(paused_common_steps),
+            "latent_trace_common_steps": list(common_steps),
             "paused_payload": paused_payload,
             "baseline_payload": baseline_payload,
             "remote_payload": remote_payload,
