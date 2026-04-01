@@ -1,241 +1,167 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-"""Profile Omni text-to-image latency across multiple image sizes.
-
-This script follows the standard Omni flow from the docs and measures how
-prompt length affects end-to-end latency. The prompt is repeated
-``prompt_length_scale`` times to approximate a longer prompt, and the CSV row
-starts with the estimated prompt token length computed from whitespace.
-"""
-
 from __future__ import annotations
 
 import argparse
 import csv
-import json
 import time
 from pathlib import Path
-from statistics import mean
 from typing import Any
 
-from vllm import SamplingParams
-
 from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-IMAGE_SIZES: list[tuple[int, int]] = [
+
+DEFAULT_MODEL = "/tmp/models/Qwen/Qwen-Image"
+DEFAULT_PROMPT = "a cup of coffee on a table"
+DEFAULT_NEGATIVE_PROMPT = "blurry low quality distorted deformed watermark"
+DEFAULT_OUTPUT_CSV = "output/omni_prompt_profile.csv"
+NUM_INFERENCE_STEPS = 50
+GUIDANCE_SCALE = 7.5
+IMAGE_SIZES = (
     (256, 256),
     (512, 512),
     (1024, 1024),
     (2048, 2048),
-]
+)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Profile Omni image generation latency.")
+    parser = argparse.ArgumentParser(
+        description="Profile Omni text-to-image e2e latency by prompt length."
+    )
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Model name or path.")
     parser.add_argument(
-        "--model",
-        default="Qwen/Qwen-Image",
-        help="Diffusion model name or local path.",
+        "--output-csv",
+        default=DEFAULT_OUTPUT_CSV,
+        help="CSV file to append results to.",
     )
     parser.add_argument(
         "--prompt",
-        default="a cup of coffee on the table",
-        help="Text prompt for image generation.",
-    )
-    parser.add_argument(
-        "--negative-prompt",
-        default=None,
-        help="Optional negative prompt.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Seed for sampling parameters.",
+        default=DEFAULT_PROMPT,
+        help="Base prompt text to repeat for prompt length profiling.",
     )
     parser.add_argument(
         "--prompt-length-scale",
         type=int,
         default=1,
-        help="Repeat the prompt this many times to approximate a longer prompt.",
+        help="Repeat the prompt text this many times before profiling.",
     )
     parser.add_argument(
-        "--num-inference-steps",
-        type=int,
-        default=50,
-        help="Number of diffusion steps.",
-    )
-    parser.add_argument(
-        "--cfg-scale",
-        type=float,
-        default=4.0,
-        help="True CFG scale for Qwen-Image-style models.",
-    )
-    parser.add_argument(
-        "--guidance-scale",
-        type=float,
-        default=1.0,
-        help="Guidance scale for guidance-distilled models.",
-    )
-    parser.add_argument(
-        "--guidance-scale-2",
-        type=float,
-        default=None,
-        help="Secondary guidance scale for models that support it.",
-    )
-    parser.add_argument(
-        "--output-csv",
-        type=str,
-        default="output/omni_profile.csv",
-        help="CSV file to append results to.",
+        "--enable-negative",
+        action="store_true",
+        help="Enable negative prompt profiling and write results to a separate CSV.",
     )
     return parser.parse_args()
 
 
-def _build_prompt(args: argparse.Namespace) -> dict[str, Any]:
-    prompt_scale = max(1, args.prompt_length_scale)
-    scaled_prompt = " ".join([args.prompt] * prompt_scale)
-    prompt: dict[str, Any] = {"prompt": scaled_prompt}
-    if args.negative_prompt is not None:
-        prompt["negative_prompt"] = args.negative_prompt
-    return prompt
+def _repeat_text(text: str, scale: int) -> str:
+    repeat_count = max(1, scale)
+    return " ".join([text] * repeat_count)
 
 
 def _estimate_prompt_token_length(prompt_text: str) -> int:
     return len(prompt_text.split())
 
 
-def _get_stage_types(omni: Omni) -> list[str]:
-    stage_types: list[str] = []
-    for stage in omni.stage_list:
-        if isinstance(stage, dict):
-            stage_types.append(stage.get("stage_type", "diffusion"))
-        else:
-            stage_types.append(getattr(stage, "stage_type", "diffusion"))
-    return stage_types
+def _derive_output_csv_path(output_csv: str, enable_negative: bool) -> Path:
+    output_path = Path(output_csv)
+    if not enable_negative:
+        return output_path
+    suffix = output_path.suffix or ".csv"
+    return output_path.with_name(f"{output_path.stem}_negative{suffix}")
 
 
-def _build_sampling_params(args: argparse.Namespace) -> OmniDiffusionSamplingParams:
-    return OmniDiffusionSamplingParams(
-        height=1024,
-        width=1024,
-        num_inference_steps=args.num_inference_steps,
-        true_cfg_scale=args.cfg_scale,
-        guidance_scale=args.guidance_scale,
-        guidance_scale_2=args.guidance_scale_2,
-        seed=args.seed,
-    )
+def _build_request(
+    prompt_text: str,
+    negative_prompt_text: str,
+    width: int,
+    height: int,
+) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "prompt": prompt_text,
+        "width": width,
+        "height": height,
+        "num_inference_steps": NUM_INFERENCE_STEPS,
+        "guidance_scale": GUIDANCE_SCALE,
+    }
+    if negative_prompt_text:
+        request["negative_prompt"] = negative_prompt_text
+    return request
 
 
-def _build_sampling_params_list(omni: Omni, diffusion_params: OmniDiffusionSamplingParams) -> list[Any]:
-    stage_types = _get_stage_types(omni)
-    default_params_list = list(getattr(omni, "default_sampling_params_list", []) or [])
-    if len(default_params_list) != len(stage_types):
-        fallback = [OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams() for st in stage_types]
-        default_params_list = (default_params_list + fallback)[: len(stage_types)]
-
-    sampling_params_list: list[Any] = []
-    for idx, stage_type in enumerate(stage_types):
-        if stage_type == "diffusion":
-            sampling_params_list.append(diffusion_params.clone())
-        else:
-            sampling_params_list.append(default_params_list[idx])
-    return sampling_params_list
-
-
-def _format_latency_list(latencies_ms: list[float]) -> str:
-    return json.dumps([round(latency, 3) for latency in latencies_ms], ensure_ascii=False)
-
-
-def _append_csv_row(csv_path: Path, row: dict[str, str]) -> None:
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["prompt_token_length", "256x256", "512x512", "1024x1024", "2048x2048"]
-    file_exists = csv_path.exists() and csv_path.stat().st_size > 0
-
-    with csv_path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
-
-
-def _run_batch(
-    omni: Omni,
-    prompt: dict[str, Any],
-    *,
-    sampling_params_list: list[Any],
-    record: bool,
-) -> float:
-    batch_start = time.perf_counter()
-
-    output_count = 0
-    final_latency_ms = 0.0
-    for output in omni._run_generation(  # noqa: SLF001 - keep the instance alive across multiple runs
-        prompt,
-        sampling_params_list,
-        use_tqdm=False,
-    ):
-        output_count += 1
-        final_latency_ms = (time.perf_counter() - batch_start) * 1000.0
-        if record:
-            print(f"[request_id={output.request_id}] e2e latency: {final_latency_ms:.2f} ms")
-
-    if output_count != 1:
-        raise RuntimeError(f"Expected 1 output, got {output_count}")
-
-    if not record:
-        print("warmup complete")
-
-    return final_latency_ms
+def _run_request(omni: Omni, request: dict[str, Any]) -> float:
+    start = time.perf_counter()
+    outputs = list(omni.generate([request]))
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    if len(outputs) != 1:
+        raise RuntimeError(f"Expected exactly one output, got {len(outputs)}")
+    return elapsed_ms
 
 
 def main() -> None:
     args = parse_args()
-    csv_path = Path(args.output_csv)
+    if args.prompt_length_scale < 1:
+        raise ValueError("--prompt-length-scale must be a positive integer")
 
     omni = Omni(model=args.model)
-    try:
-        print(f"Model: {args.model}")
-        print(f"Prompt length scale: {max(1, args.prompt_length_scale)}")
-        print(f"Num inference steps: {args.num_inference_steps}")
-        print(f"CSV output: {csv_path}")
 
-        prompt = _build_prompt(args)
-        prompt_token_length = _estimate_prompt_token_length(prompt["prompt"])
-        measured_row: dict[str, str] = {"prompt_token_length": str(prompt_token_length)}
+    prompt_text = _repeat_text(args.prompt, args.prompt_length_scale)
+    prompt_token_length = _estimate_prompt_token_length(prompt_text)
 
-        for size_idx, size in enumerate(IMAGE_SIZES):
-            height, width = size
-            size_label = f"{height}x{width}"
-            print(f"\n=== {size_label} ===")
+    negative_prompt_text = ""
+    negative_prompt_token_length = 0
+    if args.enable_negative:
+        negative_prompt_text = _repeat_text(
+            DEFAULT_NEGATIVE_PROMPT, args.prompt_length_scale
+        )
+        negative_prompt_token_length = _estimate_prompt_token_length(
+            negative_prompt_text
+        )
 
-            warmup_sampling_params = _build_sampling_params(args)
-            warmup_sampling_params.height = height
-            warmup_sampling_params.width = width
-            warmup_sampling_params_list = _build_sampling_params_list(omni, warmup_sampling_params)
-            _run_batch(omni, prompt, sampling_params_list=warmup_sampling_params_list, record=False)
+    output_csv = _derive_output_csv_path(args.output_csv, args.enable_negative)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
 
-            measured_sampling_params = _build_sampling_params(args)
-            measured_sampling_params.height = height
-            measured_sampling_params.width = width
-            # Keep the row deterministic across sizes while still using a fixed seed.
-            measured_sampling_params.seed = args.seed + size_idx * 10_000
-            measured_sampling_params_list = _build_sampling_params_list(omni, measured_sampling_params)
+    print(f"Model: {args.model}")
+    print(f"Output CSV: {output_csv}")
+    print(f"Prompt length scale: {args.prompt_length_scale}")
+    print(f"Prompt token length: {prompt_token_length}")
+    print(f"Negative prompt enabled: {args.enable_negative}")
+    if args.enable_negative:
+        print(f"Negative prompt token length: {negative_prompt_token_length}")
 
-            latency_ms = _run_batch(
-                omni,
-                prompt,
-                sampling_params_list=measured_sampling_params_list,
-                record=True,
+    fieldnames = [
+        "prompt_token_length",
+        "negative_prompt_token_length",
+        "256x256",
+        "512x512",
+        "1024x1024",
+        "2048x2048",
+    ]
+
+    csv_exists = output_csv.exists()
+    with output_csv.open("a", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        if not csv_exists:
+            writer.writeheader()
+
+        # Prewarm the instance once per size before recording latency.
+        for width, height in IMAGE_SIZES:
+            warmup_request = _build_request(
+                prompt_text, negative_prompt_text, width, height
             )
-            measured_row[size_label] = f"{latency_ms:.3f}"
+            _run_request(omni, warmup_request)
 
-        _append_csv_row(csv_path, measured_row)
-        print(f"\nAppended results to {csv_path}")
-    finally:
-        omni.close()
+        row: dict[str, Any] = {
+            "prompt_token_length": prompt_token_length,
+            "negative_prompt_token_length": negative_prompt_token_length,
+        }
+
+        for width, height in IMAGE_SIZES:
+            request = _build_request(prompt_text, negative_prompt_text, width, height)
+            latency_ms = _run_request(omni, request)
+            size_key = f"{width}x{height}"
+            row[size_key] = f"{latency_ms:.3f}"
+            print(f"{size_key}: {latency_ms:.3f} ms")
+
+        writer.writerow(row)
 
 
 if __name__ == "__main__":
