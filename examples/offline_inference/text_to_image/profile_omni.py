@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
 DEFAULT_MODEL = "/tmp/models/Qwen/Qwen-Image"
@@ -69,27 +70,30 @@ def _derive_output_csv_path(output_csv: str, enable_negative: bool) -> Path:
     return output_path.with_name(f"{output_path.stem}_negative{suffix}")
 
 
-def _build_request(
-    prompt_text: str,
-    negative_prompt_text: str,
-    width: int,
-    height: int,
-) -> dict[str, Any]:
-    request: dict[str, Any] = {
-        "prompt": prompt_text,
-        "width": width,
-        "height": height,
-        "num_inference_steps": NUM_INFERENCE_STEPS,
-        "guidance_scale": GUIDANCE_SCALE,
-    }
+def _build_prompt(prompt_text: str, negative_prompt_text: str) -> dict[str, Any]:
+    prompt: dict[str, Any] = {"prompt": prompt_text}
     if negative_prompt_text:
-        request["negative_prompt"] = negative_prompt_text
-    return request
+        prompt["negative_prompt"] = negative_prompt_text
+    return prompt
 
 
-def _run_request(omni: Omni, request: dict[str, Any]) -> float:
+def _build_sampling_params(width: int, height: int) -> OmniDiffusionSamplingParams:
+    return OmniDiffusionSamplingParams(
+        height=height,
+        width=width,
+        num_inference_steps=NUM_INFERENCE_STEPS,
+        guidance_scale=GUIDANCE_SCALE,
+        num_outputs_per_prompt=1,
+    )
+
+
+def _run_request(
+    omni: Omni,
+    prompt: dict[str, Any],
+    sampling_params: OmniDiffusionSamplingParams,
+) -> float:
     start = time.perf_counter()
-    outputs = list(omni.generate([request]))
+    outputs = omni.generate(prompt, sampling_params)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
     if len(outputs) != 1:
         raise RuntimeError(f"Expected exactly one output, got {len(outputs)}")
@@ -144,10 +148,9 @@ def main() -> None:
 
         # Prewarm the instance once per size before recording latency.
         for width, height in IMAGE_SIZES:
-            warmup_request = _build_request(
-                prompt_text, negative_prompt_text, width, height
-            )
-            _run_request(omni, warmup_request)
+            warmup_prompt = _build_prompt(prompt_text, negative_prompt_text)
+            warmup_sampling_params = _build_sampling_params(width, height)
+            _run_request(omni, warmup_prompt, warmup_sampling_params)
 
         row: dict[str, Any] = {
             "prompt_token_length": prompt_token_length,
@@ -155,8 +158,9 @@ def main() -> None:
         }
 
         for width, height in IMAGE_SIZES:
-            request = _build_request(prompt_text, negative_prompt_text, width, height)
-            latency_ms = _run_request(omni, request)
+            request_prompt = _build_prompt(prompt_text, negative_prompt_text)
+            sampling_params = _build_sampling_params(width, height)
+            latency_ms = _run_request(omni, request_prompt, sampling_params)
             size_key = f"{width}x{height}"
             row[size_key] = f"{latency_ms:.3f}"
             print(f"{size_key}: {latency_ms:.3f} ms")
