@@ -3,14 +3,10 @@
 
 """Profile Omni text-to-image latency across multiple image sizes.
 
-This script follows the standard Omni batch flow from the docs:
-
-    from vllm_omni.entrypoints.omni import Omni
-    omni_outputs = omni.generate(prompts)
-
-It runs one warmup batch before measuring each image size, then records the
-end-to-end latency for each request in the batch. Results are appended to a CSV
-file with one row per batch size and one column per image size.
+This script follows the standard Omni flow from the docs and measures how
+prompt length affects end-to-end latency. The prompt is repeated
+``prompt_length_scale`` times to approximate a longer prompt, and the CSV row
+starts with the estimated prompt token length computed from whitespace.
 """
 
 from __future__ import annotations
@@ -60,10 +56,10 @@ def parse_args() -> argparse.Namespace:
         help="Seed for sampling parameters.",
     )
     parser.add_argument(
-        "--batch-size",
+        "--prompt-length-scale",
         type=int,
         default=1,
-        help="Number of prompts to pass in one Omni.generate() call.",
+        help="Repeat the prompt this many times to approximate a longer prompt.",
     )
     parser.add_argument(
         "--num-inference-steps",
@@ -99,15 +95,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def _build_prompt(args: argparse.Namespace) -> dict[str, Any]:
-    prompt: dict[str, Any] = {"prompt": args.prompt}
+    prompt_scale = max(1, args.prompt_length_scale)
+    scaled_prompt = " ".join([args.prompt] * prompt_scale)
+    prompt: dict[str, Any] = {"prompt": scaled_prompt}
     if args.negative_prompt is not None:
         prompt["negative_prompt"] = args.negative_prompt
     return prompt
 
 
-def _build_prompts(args: argparse.Namespace) -> list[dict[str, Any]]:
-    prompt = _build_prompt(args)
-    return [dict(prompt) for _ in range(max(1, args.batch_size))]
+def _estimate_prompt_token_length(prompt_text: str) -> int:
+    return len(prompt_text.split())
 
 
 def _get_stage_types(omni: Omni) -> list[str]:
@@ -154,7 +151,7 @@ def _format_latency_list(latencies_ms: list[float]) -> str:
 
 def _append_csv_row(csv_path: Path, row: dict[str, str]) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["batch_size", "256x256", "512x512", "1024x1024", "2048x2048"]
+    fieldnames = ["prompt_token_length", "256x256", "512x512", "1024x1024", "2048x2048"]
     file_exists = csv_path.exists() and csv_path.stat().st_size > 0
 
     with csv_path.open("a", newline="", encoding="utf-8") as f:
@@ -166,49 +163,48 @@ def _append_csv_row(csv_path: Path, row: dict[str, str]) -> None:
 
 def _run_batch(
     omni: Omni,
-    prompts: list[dict[str, Any]],
+    prompt: dict[str, Any],
     *,
     sampling_params_list: list[Any],
     record: bool,
-) -> list[float]:
+) -> float:
     batch_start = time.perf_counter()
-    latencies_ms: list[float] = []
 
-    for output in omni._run_generation(  # noqa: SLF001 - keep batch alive across multiple runs
-        prompts,
+    output_count = 0
+    final_latency_ms = 0.0
+    for output in omni._run_generation(  # noqa: SLF001 - keep the instance alive across multiple runs
+        prompt,
         sampling_params_list,
         use_tqdm=False,
     ):
-        latency_ms = (time.perf_counter() - batch_start) * 1000.0
-        latencies_ms.append(latency_ms)
+        output_count += 1
+        final_latency_ms = (time.perf_counter() - batch_start) * 1000.0
         if record:
-            print(f"[request_id={output.request_id}] e2e latency: {latency_ms:.2f} ms")
+            print(f"[request_id={output.request_id}] e2e latency: {final_latency_ms:.2f} ms")
 
-    if len(latencies_ms) != len(prompts):
-        raise RuntimeError(f"Expected {len(prompts)} outputs, got {len(latencies_ms)}")
+    if output_count != 1:
+        raise RuntimeError(f"Expected 1 output, got {output_count}")
 
-    if record:
-        print(f"batch mean e2e latency: {mean(latencies_ms):.2f} ms")
-    else:
-        print("warmup batch complete")
+    if not record:
+        print("warmup complete")
 
-    return latencies_ms
+    return final_latency_ms
 
 
 def main() -> None:
     args = parse_args()
-    batch_size = max(1, args.batch_size)
     csv_path = Path(args.output_csv)
 
-    omni = Omni(model=args.model, max_batch_size=batch_size)
+    omni = Omni(model=args.model)
     try:
         print(f"Model: {args.model}")
-        print(f"Batch size: {batch_size}")
+        print(f"Prompt length scale: {max(1, args.prompt_length_scale)}")
         print(f"Num inference steps: {args.num_inference_steps}")
         print(f"CSV output: {csv_path}")
 
-        measured_row: dict[str, str] = {"batch_size": str(batch_size)}
-        prompts = _build_prompts(args)
+        prompt = _build_prompt(args)
+        prompt_token_length = _estimate_prompt_token_length(prompt["prompt"])
+        measured_row: dict[str, str] = {"prompt_token_length": str(prompt_token_length)}
 
         for size_idx, size in enumerate(IMAGE_SIZES):
             height, width = size
@@ -219,7 +215,7 @@ def main() -> None:
             warmup_sampling_params.height = height
             warmup_sampling_params.width = width
             warmup_sampling_params_list = _build_sampling_params_list(omni, warmup_sampling_params)
-            _run_batch(omni, prompts, sampling_params_list=warmup_sampling_params_list, record=False)
+            _run_batch(omni, prompt, sampling_params_list=warmup_sampling_params_list, record=False)
 
             measured_sampling_params = _build_sampling_params(args)
             measured_sampling_params.height = height
@@ -228,13 +224,13 @@ def main() -> None:
             measured_sampling_params.seed = args.seed + size_idx * 10_000
             measured_sampling_params_list = _build_sampling_params_list(omni, measured_sampling_params)
 
-            latencies_ms = _run_batch(
+            latency_ms = _run_batch(
                 omni,
-                prompts,
+                prompt,
                 sampling_params_list=measured_sampling_params_list,
                 record=True,
             )
-            measured_row[size_label] = _format_latency_list(latencies_ms)
+            measured_row[size_label] = f"{latency_ms:.3f}"
 
         _append_csv_row(csv_path, measured_row)
         print(f"\nAppended results to {csv_path}")
