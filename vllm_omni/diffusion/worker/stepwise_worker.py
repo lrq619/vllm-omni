@@ -1095,7 +1095,8 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                 else:
                     pause_step_idx = None
 
-                true_cfg_scale = float(sp.true_cfg_scale or 4.0)
+                # true_cfg_scale = float(sp.true_cfg_scale or 4.0)
+                guidance_scale = float(sp.guidance_scale or 4.0)
                 noise_level = float(sp.extra_args.get("noise_level", 0.7))
                 sde_window_size = sp.extra_args.get("sde_window_size", None)
                 sde_window_range = sp.extra_args.get("sde_window_range", (0, 5))
@@ -1118,7 +1119,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                     negative_prompt_mask = torch.tensor(negative_prompt_mask, device=pipeline.device)
 
                 has_neg_prompt = negative_prompt_ids is not None
-                do_true_cfg = bool(true_cfg_scale > 1 and has_neg_prompt)
+                do_true_cfg = bool(guidance_scale > 1 and has_neg_prompt)
 
                 prompt_embeds, prompt_embeds_mask = pipeline.encode_prompt(
                     prompt_ids=prompt_ids,
