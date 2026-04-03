@@ -41,7 +41,8 @@ class MooncakeStore:
         self.protocol = protocol or os.environ.get("MOONCAKE_PROTOCOL", "tcp")
         self.node_addr = node_addr or os.environ.get("MOONCAKE_NODE_ADDR", _get_hostname_ip())
         self.local_buffer_size = local_buffer_size
-        self.segment_size_gb = int(os.environ.get("MOONCAKE_SEGMENT_SIZE_GB", "32"))
+        # self.segment_size_gb = int(os.environ.get("MOONCAKE_SEGMENT_SIZE_GB", "256"))
+        self.segment_size_gb = 256
         if self.segment_size_gb <= 0:
             raise ValueError(
                 f"Invalid MOONCAKE_SEGMENT_SIZE_GB={self.segment_size_gb}; expected a positive integer."
