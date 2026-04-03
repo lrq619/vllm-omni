@@ -62,7 +62,7 @@ class WorkerRequestState:
     max_steps: int
     pause_step_idx: int | None
     do_true_cfg: bool
-    true_cfg_scale: float
+    # true_cfg_scale: float
     noise_level: float
     sde_window: tuple[int, int]
     sde_type: str
@@ -1283,7 +1283,7 @@ class DiffusionStepwiseWorker(DiffusionWorker):
                     max_steps=len(timesteps),
                     pause_step_idx=pause_step_idx,
                     do_true_cfg=do_true_cfg,
-                    true_cfg_scale=true_cfg_scale,
+                    # true_cfg_scale=true_cfg_scale,
                     noise_level=noise_level,
                     sde_window=sde_window,
                     sde_type=sde_type,
