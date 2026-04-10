@@ -420,7 +420,11 @@ def _create_async_omni(model: str, config_path: Path) -> AsyncOmni:
     )
 
 
-def _make_sampling_params() -> OmniDiffusionSamplingParams:
+def _make_sampling_params(
+    *,
+    sde_window_size: int = 2,
+    sde_window_range: tuple[int, int] = (0, 5),
+) -> OmniDiffusionSamplingParams:
     return OmniDiffusionSamplingParams(
         num_inference_steps=50,
         true_cfg_scale=4.0,
@@ -428,8 +432,34 @@ def _make_sampling_params() -> OmniDiffusionSamplingParams:
         height=512,
         output_type="pil",
         seed=42,
-        extra_args={"noise_level": 1, "sde_type": "sde", "logprobs": True, "sde_window_size": 2, "sde_window_range": [0, 5]},
+        extra_args={
+            "noise_level": 1,
+            "sde_type": "sde",
+            "logprobs": True,
+            "sde_window_size": sde_window_size,
+            "sde_window_range": list(sde_window_range),
+        },
     )
+
+
+def _assert_tensor_fields_match(
+    left_payload: dict[str, Any],
+    right_payload: dict[str, Any],
+    *,
+    field_names: tuple[str, ...],
+) -> None:
+    left_custom_output = left_payload.get("custom_output")
+    right_custom_output = right_payload.get("custom_output")
+    if not isinstance(left_custom_output, dict):
+        raise RuntimeError(f"Expected left custom_output to be a dict, got {type(left_custom_output).__name__}")
+    if not isinstance(right_custom_output, dict):
+        raise RuntimeError(f"Expected right custom_output to be a dict, got {type(right_custom_output).__name__}")
+
+    for field_name in field_names:
+        left_value = left_custom_output.get(field_name)
+        right_value = right_custom_output.get(field_name)
+        if left_value != right_value:
+            raise RuntimeError(f"Mismatch in custom_output.{field_name}")
 
 
 async def _run_request(
@@ -678,7 +708,14 @@ def test_migration(tmp_path: Path):
     asyncio.run(_run_migration(tmp_path))
 
 
-async def _run_migration_with_pause_step_idx(tmp_path: Path) -> None:
+async def _run_migration_with_pause_step_idx(
+    tmp_path: Path,
+    *,
+    sampling_params: OmniDiffusionSamplingParams | None = None,
+    out_root_name: str = "output/test_migration_pause_step_idx",
+    config_suffix: str = "pause_step_idx",
+    pause_step_idx: int = 25,
+) -> None:
     if torch.cuda.device_count() < 2:
         pytest.skip("Requires at least 2 GPUs.")
 
@@ -698,15 +735,18 @@ async def _run_migration_with_pause_step_idx(tmp_path: Path) -> None:
     prompt_ids, prompt_mask = _chat_template_to_ids(tokenizer, prompt_messages)
     negative_prompt_ids, negative_prompt_mask = _chat_template_to_ids(tokenizer, negative_prompt_messages)
 
-    out_root = Path("output/test_migration_pause_step_idx")
+    out_root = Path(out_root_name)
     if out_root.exists():
         shutil.rmtree(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    config0 = tmp_path / "stage_gpu0_pause_step_idx.yaml"
-    config1 = tmp_path / "stage_gpu1_pause_step_idx.yaml"
+    config0 = tmp_path / f"stage_gpu0_{config_suffix}.yaml"
+    config1 = tmp_path / f"stage_gpu1_{config_suffix}.yaml"
     _write_single_stage_config(config0, 0)
     _write_single_stage_config(config1, 1)
+
+    if sampling_params is None:
+        sampling_params = _make_sampling_params()
 
     # Construct both AsyncOmni instances in parallel so the two GPU stages
     # come up independently instead of serializing startup.
@@ -718,7 +758,6 @@ async def _run_migration_with_pause_step_idx(tmp_path: Path) -> None:
     try:
         req0_id = "migration-req-pause-step-idx-0"
         req1_id = "migration-req-pause-step-idx-1"
-        pause_step_idx = 25
         logger.info(
             "[MigrationTrace] Created AsyncOmni instances; launching local requests with pause_step_idx=%d",
             pause_step_idx,
@@ -734,7 +773,7 @@ async def _run_migration_with_pause_step_idx(tmp_path: Path) -> None:
                 prompt_mask=prompt_mask,
                 negative_prompt_ids=negative_prompt_ids,
                 negative_prompt_mask=negative_prompt_mask,
-                sampling_params=_make_sampling_params(),
+                sampling_params=sampling_params,
                 out_root=out_root / "paused",
                 pause_step_idx=pause_step_idx,
             )
@@ -749,7 +788,7 @@ async def _run_migration_with_pause_step_idx(tmp_path: Path) -> None:
                 prompt_mask=prompt_mask,
                 negative_prompt_ids=negative_prompt_ids,
                 negative_prompt_mask=negative_prompt_mask,
-                sampling_params=_make_sampling_params(),
+                sampling_params=sampling_params,
                 out_root=out_root / "baseline",
             )
         )
@@ -796,7 +835,7 @@ async def _run_migration_with_pause_step_idx(tmp_path: Path) -> None:
                 prompt_mask=prompt_mask,
                 negative_prompt_ids=negative_prompt_ids,
                 negative_prompt_mask=negative_prompt_mask,
-                sampling_params=_make_sampling_params(),
+                sampling_params=sampling_params,
                 out_root=out_root / "remote",
                 is_remote=True,
             )
@@ -853,6 +892,11 @@ async def _run_migration_with_pause_step_idx(tmp_path: Path) -> None:
         normalized_remote.pop("request_id", None)
         normalized_remote.pop("image_path", None)
 
+        _assert_tensor_fields_match(
+            normalized_baseline,
+            normalized_remote,
+            field_names=("all_latents", "all_timesteps", "rollout_log_probs"),
+        )
         assert normalized_baseline == normalized_remote, "Migrated output does not match baseline output."
 
         baseline_img = Image.open(out_root / "baseline" / "req_1" / "output.png").convert("RGB")
@@ -887,6 +931,19 @@ async def _run_migration_with_pause_step_idx(tmp_path: Path) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
 def test_migration_with_pause_step_idx(tmp_path: Path):
     asyncio.run(_run_migration_with_pause_step_idx(tmp_path))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
+def test_migration_with_pause_step_idx_inside_sde_window(tmp_path: Path):
+    asyncio.run(
+        _run_migration_with_pause_step_idx(
+            tmp_path,
+            sampling_params=_make_sampling_params(sde_window_size=6, sde_window_range=(20, 30)),
+            out_root_name="output/test_migration_pause_step_idx_inside_sde_window",
+            config_suffix="pause_step_idx_inside_sde_window",
+            pause_step_idx=25,
+        )
+    )
 
 
 async def _run_migration_with_pause_step_idx_stress(tmp_path: Path) -> None:
