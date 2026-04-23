@@ -492,12 +492,18 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
-        # Keep an explicitly provided master_port unchanged so upstream callers
-        # can reserve a rendezvous port and pass it through deterministically.
         if self.master_port is None:
-            initial_master_port = 30005 + random.randint(0, 100)
-            self.master_port = self.settle_port(initial_master_port, 37)
-        logger.info("Using diffusion master_port=%s", self.master_port)
+            raise ValueError(
+                "OmniDiffusionConfig.master_port must be provided explicitly; "
+                "automatic port allocation has been removed so missing values fail fast."
+            )
+        logger.info(
+            "Constructed OmniDiffusionConfig(model=%s, master_port=%s, num_gpus=%s, parallel_world_size=%s)",
+            self.model,
+            self.master_port,
+            self.num_gpus,
+            getattr(self.parallel_config, "world_size", None),
+        )
 
         # Convert parallel_config dict to DiffusionParallelConfig if needed
         # This must be done before accessing parallel_config.world_size
@@ -603,6 +609,13 @@ class OmniDiffusionConfig:
         # Filter kwargs to only include valid fields
         valid_fields = {f.name for f in fields(cls)}
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
+
+        logger.info(
+            "OmniDiffusionConfig.from_kwargs received keys=%s master_port=%s model=%s",
+            sorted(kwargs.keys()),
+            kwargs.get("master_port", None),
+            kwargs.get("model", None),
+        )
 
         return cls(**filtered_kwargs)
 
