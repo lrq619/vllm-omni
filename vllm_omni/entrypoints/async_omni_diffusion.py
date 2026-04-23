@@ -62,16 +62,19 @@ class AsyncOmniDiffusion:
         engine_input_source = kwargs.get("engine_input_source")
         cfg_kv_collect_func = kwargs.pop("cfg_kv_collect_func", None)
 
+        config_kwargs = dict(kwargs)
+
         # Build config
         if od_config is None:
-            od_config = OmniDiffusionConfig.from_kwargs(model=model, **kwargs)
+            od_config = OmniDiffusionConfig.from_kwargs(model=model, **config_kwargs)
         elif isinstance(od_config, dict):
-            # If config is dict, check it too (priority to kwargs if both exist)
-            if stage_id is None:
-                stage_id = od_config.get("stage_id")
-            if engine_input_source is None:
-                engine_input_source = od_config.get("engine_input_source")
-            od_config = OmniDiffusionConfig.from_kwargs(**od_config)
+            # Merge top-level kwargs into the config dict so caller-provided
+            # overrides such as master_port are not dropped.
+            merged_config = dict(od_config)
+            merged_config.update(config_kwargs)
+            stage_id = merged_config.get("stage_id")
+            engine_input_source = merged_config.get("engine_input_source")
+            od_config = OmniDiffusionConfig.from_kwargs(**merged_config)
 
         self.od_config = od_config
 

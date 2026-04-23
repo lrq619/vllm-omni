@@ -492,9 +492,12 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
-        # TODO: remove hard code
-        initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
-        self.master_port = self.settle_port(initial_master_port, 37)
+        # Keep an explicitly provided master_port unchanged so upstream callers
+        # can reserve a rendezvous port and pass it through deterministically.
+        if self.master_port is None:
+            initial_master_port = 30005 + random.randint(0, 100)
+            self.master_port = self.settle_port(initial_master_port, 37)
+        logger.info("Using diffusion master_port=%s", self.master_port)
 
         # Convert parallel_config dict to DiffusionParallelConfig if needed
         # This must be done before accessing parallel_config.world_size
