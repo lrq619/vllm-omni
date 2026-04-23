@@ -64,6 +64,7 @@ from vllm_omni.outputs import OmniRequestOutput
 _R = TypeVar("_R")
 
 logger = init_logger(__name__)
+TRACE_PREFIX = "[ROLL-MASTER-PORT]"
 
 
 @contextmanager
@@ -515,6 +516,13 @@ class OmniStage:
             AssertionError: If queues are not attached before calling this method
         """
         assert self._in_q is not None and self._out_q is not None, "Queues must be attached before start_process"
+        logger.info(
+            "%s OmniStage.init_stage_worker stage_id=%s stage_type=%s master_port=%s",
+            TRACE_PREFIX,
+            self.stage_id,
+            self.stage_type,
+            getattr(self.engine_args, "get", lambda _k, _d=None: None)("master_port"),
+        )
 
         if worker_backend == "ray":
             ray_placement_group = kwargs.get("ray_placement_group", None)
@@ -814,6 +822,14 @@ def _stage_worker(
     stage_type: Literal["llm", "diffusion"] = stage_payload.get("stage_type", "llm")
 
     cfg_kv_collect_func = load_func_from_config(stage_payload.get("cfg_kv_collect_func"))
+    logger.info(
+        "%s _stage_worker stage_id=%s stage_type=%s master_port=%s keys=%s",
+        TRACE_PREFIX,
+        stage_id,
+        stage_type,
+        engine_args.get("master_port") if hasattr(engine_args, "get") else None,
+        sorted(engine_args.keys()) if hasattr(engine_args, "keys") else None,
+    )
 
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args)
@@ -868,6 +884,13 @@ def _stage_worker(
             engine_args["stage_id"] = stage_id
         if stage_type == "diffusion":
             engine_args = filter_dataclass_kwargs(OmniDiffusionConfig, engine_args)
+            logger.info(
+                "%s _stage_worker filtered stage_id=%s master_port=%s keys=%s",
+                TRACE_PREFIX,
+                stage_id,
+                engine_args.get("master_port") if hasattr(engine_args, "get") else None,
+                sorted(engine_args.keys()) if hasattr(engine_args, "keys") else None,
+            )
             engine_args.pop("model_stage", None)
             engine_args.pop("model", None)
             stage_engine = OmniDiffusion(
@@ -1258,6 +1281,14 @@ async def _stage_worker_async(
     final_output_type = stage_payload.get("final_output_type", None)
 
     cfg_kv_collect_func = load_func_from_config(stage_payload.get("cfg_kv_collect_func"))
+    logger.info(
+        "%s _stage_worker_async stage_id=%s stage_type=%s master_port=%s keys=%s",
+        TRACE_PREFIX,
+        stage_id,
+        stage_type,
+        engine_args.get("master_port") if hasattr(engine_args, "get") else None,
+        sorted(engine_args.keys()) if hasattr(engine_args, "keys") else None,
+    )
     # Handle non-standard model directory structures (e.g., tokenizer in root, model in subdir)
     model = _resolve_model_tokenizer_paths(model, engine_args)
 
@@ -1327,6 +1358,13 @@ async def _stage_worker_async(
         if stage_type == "diffusion":
             # For diffusion, we need to extract diffusion-specific config
             engine_args = filter_dataclass_kwargs(OmniDiffusionConfig, engine_args)
+            logger.info(
+                "%s _stage_worker_async filtered stage_id=%s master_port=%s keys=%s",
+                TRACE_PREFIX,
+                stage_id,
+                engine_args.get("master_port") if hasattr(engine_args, "get") else None,
+                sorted(engine_args.keys()) if hasattr(engine_args, "keys") else None,
+            )
             od_config = _build_od_config(engine_args, model)
 
             # Inject omni config for worker to access stage info

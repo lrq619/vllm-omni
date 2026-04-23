@@ -17,6 +17,7 @@ from vllm_omni.platforms import current_omni_platform
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 logger = init_logger(__name__)
+TRACE_PREFIX = "[ROLL-MASTER-PORT]"
 
 
 def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
@@ -249,6 +250,12 @@ def load_stage_configs_from_model(model: str, base_engine_args: dict | None = No
     """
     if base_engine_args is None:
         base_engine_args = {}
+    logger.info(
+        "%s load_stage_configs_from_model master_port=%s keys=%s",
+        TRACE_PREFIX,
+        base_engine_args.get("master_port") if hasattr(base_engine_args, "get") else None,
+        sorted(base_engine_args.keys()) if hasattr(base_engine_args, "keys") else None,
+    )
     stage_config_path = resolve_model_config_path(model)
     if stage_config_path is None:
         return []
@@ -267,6 +274,13 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
     """
     if base_engine_args is None:
         base_engine_args = {}
+    logger.info(
+        "%s load_stage_configs_from_yaml path=%s master_port=%s keys=%s",
+        TRACE_PREFIX,
+        config_path,
+        base_engine_args.get("master_port") if hasattr(base_engine_args, "get") else None,
+        sorted(base_engine_args.keys()) if hasattr(base_engine_args, "keys") else None,
+    )
     config_data = OmegaConf.load(config_path)
     stage_args = config_data.stage_args
     global_async_chunk = config_data.get("async_chunk", False)
@@ -306,6 +320,13 @@ def load_and_resolve_stage_configs(
     Returns:
         Tuple of (config_path, stage_configs)
     """
+    logger.info(
+        "%s load_and_resolve_stage_configs start model=%s stage_configs_path=%s master_port=%s",
+        TRACE_PREFIX,
+        model,
+        stage_configs_path,
+        kwargs.get("master_port") if kwargs is not None and hasattr(kwargs, "get") else None,
+    )
     if stage_configs_path is None:
         config_path = resolve_model_config_path(model)
         stage_configs = load_stage_configs_from_model(model, base_engine_args=kwargs)

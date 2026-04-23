@@ -25,6 +25,7 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+TRACE_PREFIX = "[ROLL-MASTER-PORT]"
 
 
 class AsyncOmniDiffusion:
@@ -56,6 +57,12 @@ class AsyncOmniDiffusion:
         **kwargs: Any,
     ):
         self.model = model
+        logger.info(
+            "%s AsyncOmniDiffusion.__init__ received master_port=%s keys=%s",
+            TRACE_PREFIX,
+            kwargs.get("master_port"),
+            sorted(kwargs.keys()),
+        )
 
         # Capture stage info from kwargs before they might be filtered out
         stage_id = kwargs.get("stage_id")

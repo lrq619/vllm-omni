@@ -38,6 +38,7 @@ from vllm_omni.outputs import OmniRequestOutput
 _R = TypeVar("_R")
 
 logger = init_logger(__name__)
+TRACE_PREFIX = "[ROLL-MASTER-PORT]"
 
 
 def _weak_close_cleanup_async(stage_list, stage_in_queues, stage_out_queues, ray_pg, output_handler, zmq_ctx=None):
@@ -103,6 +104,12 @@ class AsyncOmni(OmniBase):
     """
 
     def __init__(self, model: str, **kwargs: dict[str, Any]) -> None:
+        logger.info(
+            "%s AsyncOmni.__init__ received master_port=%s keys=%s",
+            TRACE_PREFIX,
+            kwargs.get("master_port"),
+            sorted(kwargs.keys()),
+        )
         # Pause/resume control attributes
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False

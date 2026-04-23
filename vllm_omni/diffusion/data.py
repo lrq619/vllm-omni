@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 # The actual import is deferred to __post_init__ to avoid import order issues
 
 logger = init_logger(__name__)
+TRACE_PREFIX = "[ROLL-MASTER-PORT]"
 
 
 @config
@@ -498,7 +499,8 @@ class OmniDiffusionConfig:
                 "automatic port allocation has been removed so missing values fail fast."
             )
         logger.info(
-            "Constructed OmniDiffusionConfig(model=%s, master_port=%s, num_gpus=%s, parallel_world_size=%s)",
+            "%s Constructed OmniDiffusionConfig(model=%s, master_port=%s, num_gpus=%s, parallel_world_size=%s)",
+            TRACE_PREFIX,
             self.model,
             self.master_port,
             self.num_gpus,
@@ -611,7 +613,8 @@ class OmniDiffusionConfig:
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
 
         logger.info(
-            "OmniDiffusionConfig.from_kwargs received keys=%s master_port=%s model=%s",
+            "%s OmniDiffusionConfig.from_kwargs received keys=%s master_port=%s model=%s",
+            TRACE_PREFIX,
             sorted(kwargs.keys()),
             kwargs.get("master_port", None),
             kwargs.get("model", None),

@@ -56,6 +56,7 @@ from vllm_omni.outputs import OmniRequestOutput
 _R = TypeVar("_R")
 
 logger = init_logger(__name__)
+TRACE_PREFIX = "[ROLL-MASTER-PORT]"
 
 
 def _weak_close_cleanup(
@@ -159,6 +160,12 @@ class OmniBase:
     """
 
     def __init__(self, model: str, **kwargs: Any) -> None:
+        logger.info(
+            "%s OmniBase.__init__ received master_port=%s keys=%s",
+            TRACE_PREFIX,
+            kwargs.get("master_port"),
+            sorted(kwargs.keys()),
+        )
         model = omni_snapshot_download(model)
         kwargs["model"] = model
 
@@ -266,6 +273,12 @@ class OmniBase:
 
     def _resolve_stage_configs(self, model: str, kwargs: dict[str, Any]) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
+        logger.info(
+            "%s OmniBase._resolve_stage_configs start master_port=%s stage_configs_path=%s",
+            TRACE_PREFIX,
+            kwargs.get("master_port"),
+            kwargs.get("stage_configs_path"),
+        )
         # TODO(wuhang):
         # Remove kwargs as parameters in the future.
         # Use dataclass directly for engine args.
