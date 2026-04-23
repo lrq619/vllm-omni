@@ -303,6 +303,8 @@ class OmniBase:
                     continue
                 if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
                     cfg.engine_args = OmegaConf.create({})
+                if kwargs.get("master_port") is not None:
+                    cfg.engine_args.master_port = kwargs["master_port"]
                 if kwargs.get("lora_path") is not None:
                     if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
                         cfg.engine_args.lora_path = kwargs["lora_path"]
@@ -322,6 +324,22 @@ class OmniBase:
                         cfg.engine_args.quantization_config = quantization_config
             except Exception as e:
                 logger.warning("Failed to inject LoRA config for stage: %s", e)
+
+        for cfg in stage_configs:
+            if getattr(cfg, "stage_type", None) != "diffusion":
+                continue
+            try:
+                logger.info(
+                    "%s OmniBase._resolve_stage_configs diffusion stage_id=%s master_port=%s keys=%s",
+                    TRACE_PREFIX,
+                    getattr(cfg, "stage_id", None),
+                    getattr(getattr(cfg, "engine_args", None), "get", lambda _k, _d=None: None)("master_port"),
+                    sorted(list(getattr(cfg, "engine_args", {}).keys()))
+                    if hasattr(getattr(cfg, "engine_args", None), "keys")
+                    else None,
+                )
+            except Exception:
+                pass
 
         return config_path, stage_configs
 
