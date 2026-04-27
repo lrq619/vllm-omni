@@ -247,6 +247,10 @@ class OmniDiffusionSamplingParams:
 
     true_cfg_scale: float | None = None  # qwen-image specific now
 
+    # TeaCache request-level control. The TeaCache backend must still be enabled
+    # at engine initialization with cache_backend="tea_cache".
+    enable_tea_cache: bool = True
+
     n_tokens: int | None = None
     extra_step_kwargs: dict[str, Any] = field(default_factory=dict)
 

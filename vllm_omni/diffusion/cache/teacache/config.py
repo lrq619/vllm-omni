@@ -38,6 +38,9 @@ _MODEL_COEFFICIENTS = {
         -2.00000000e-02,
     ],
 }
+_MODEL_COEFFICIENTS["QwenImageTransformer2DModelFixed"] = _MODEL_COEFFICIENTS[
+    "QwenImageTransformer2DModel"
+]
 
 
 @dataclass

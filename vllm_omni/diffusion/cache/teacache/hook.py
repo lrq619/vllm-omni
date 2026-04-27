@@ -64,6 +64,7 @@ class TeaCacheHook(ModelHook):
         self.state_manager = StateManager(TeaCacheState)
         self.extractor_fn = None
         self._forward_cnt = 0
+        self.request_enabled = True
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         """
@@ -110,6 +111,9 @@ class TeaCacheHook(ModelHook):
         Returns:
             Model output (format depends on model)
         """
+        if not self.request_enabled:
+            return module._original_forward(*args, **kwargs)
+
         # Get model-specific context from extractor
         # The extractor encapsulates ALL model-specific logic
         ctx = self.extractor_fn(module, *args, **kwargs)
@@ -244,6 +248,9 @@ class TeaCacheHook(ModelHook):
         self.state_manager.reset()
         self._forward_cnt = 0
         return module
+
+    def set_request_enabled(self, enabled: bool) -> None:
+        self.request_enabled = enabled
 
 
 def apply_teacache_hook(module: torch.nn.Module, config: TeaCacheConfig) -> None:
