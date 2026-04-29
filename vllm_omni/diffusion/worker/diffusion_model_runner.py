@@ -227,11 +227,11 @@ class DiffusionModelRunner:
                 self.cache_backend is not None
                 and self.cache_backend.is_enabled()
                 and self.od_config.cache_backend == "tea_cache"
-                and hasattr(self.cache_backend, "set_request_enabled")
+                and hasattr(self.cache_backend, "set_request_rel_l1_thresh")
             ):
-                self.cache_backend.set_request_enabled(
+                self.cache_backend.set_request_rel_l1_thresh(
                     self.pipeline,
-                    bool(getattr(req.sampling_params, "enable_tea_cache", True)),
+                    float(getattr(req.sampling_params, "rel_l1_thresh", 0.0)),
                 )
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):

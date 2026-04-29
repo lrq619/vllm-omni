@@ -151,17 +151,21 @@ class TeaCacheBackend(CacheBackend):
             if verbose:
                 logger.warning("Transformer has no hook registry, TeaCache may not be applied")
 
-    def set_request_enabled(self, pipeline: Any, enabled: bool) -> None:
-        """Enable or disable TeaCache fast path for the current request."""
+    def set_request_rel_l1_thresh(self, pipeline: Any, rel_l1_thresh: float) -> None:
+        """Set the TeaCache threshold for the current request.
+
+        A non-positive threshold disables the TeaCache fast path for the request.
+        """
+        rel_l1_thresh = float(rel_l1_thresh)
         transformer = pipeline.transformer
 
         if hasattr(transformer, "_hook_registry"):
             hook = transformer._hook_registry.get_hook(TeaCacheHook._HOOK_NAME)
             if hook is not None:
-                hook.set_request_enabled(enabled)
-                if not enabled:
+                hook.set_request_rel_l1_thresh(rel_l1_thresh)
+                if rel_l1_thresh <= 0:
                     hook.reset_state(transformer)
             else:
-                logger.warning("TeaCache hook not found, cannot set request enabled=%s", enabled)
+                logger.warning("TeaCache hook not found, cannot set request rel_l1_thresh=%s", rel_l1_thresh)
         else:
-            logger.warning("Transformer has no hook registry, cannot set TeaCache request enabled=%s", enabled)
+            logger.warning("Transformer has no hook registry, cannot set TeaCache request rel_l1_thresh=%s", rel_l1_thresh)

@@ -255,8 +255,10 @@ class TeaCacheHook(ModelHook):
         self._forward_cnt = 0
         return module
 
-    def set_request_enabled(self, enabled: bool) -> None:
-        self.request_enabled = enabled
+    def set_request_rel_l1_thresh(self, rel_l1_thresh: float) -> None:
+        rel_l1_thresh = float(rel_l1_thresh)
+        self.config.rel_l1_thresh = rel_l1_thresh
+        self.request_enabled = rel_l1_thresh > 0
 
 
 def apply_teacache_hook(module: torch.nn.Module, config: TeaCacheConfig) -> None:
