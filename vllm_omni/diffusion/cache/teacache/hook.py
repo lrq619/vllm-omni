@@ -114,6 +114,12 @@ class TeaCacheHook(ModelHook):
         if not self.request_enabled:
             return module._original_forward(*args, **kwargs)
 
+        step_index = getattr(module, "_teacache_step_index", None)
+        start_step = getattr(module, "_teacache_start_step", None)
+        if step_index is not None and start_step is not None and step_index < start_step:
+            self.reset_state(module)
+            return module._original_forward(*args, **kwargs)
+
         # Get model-specific context from extractor
         # The extractor encapsulates ALL model-specific logic
         ctx = self.extractor_fn(module, *args, **kwargs)
