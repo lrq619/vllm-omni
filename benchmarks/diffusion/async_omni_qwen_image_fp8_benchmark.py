@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Compare AsyncOmni Qwen-Image FP16 and FP8 latency.
+"""Compare AsyncOmni Qwen-Image BF16 and FP8 latency.
 
 This is a manual benchmark script, not a pytest test.  It creates AsyncOmni
 instances with a generated single-stage diffusion YAML so that
@@ -42,7 +42,7 @@ PROMPTS = [
     "A futuristic city tram passing under cherry blossom trees",
 ]
 
-SEEDS = [1101, 2202, 3303, 4404, 5505, 6606, 7707, 8808]
+SEED = 1101
 
 
 @dataclass
@@ -64,7 +64,7 @@ class GroupRecord:
     batch_size: int
     group_index: int
     request_ids: list[str]
-    seeds: list[int]
+    seed: int
     latency_s: float
     throughput_img_s: float
 
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="/tmp/models/Qwen-Image")
     parser.add_argument("--output-dir", default="benchmarks/diffusion/qwen_image_fp8_results")
-    parser.add_argument("--gpu", default="0", help="GPU id used by both FP16 and FP8 instances.")
+    parser.add_argument("--gpu", default="0", help="GPU id used by both BF16 and FP8 instances.")
     parser.add_argument("--batch-sizes", default="1,2,4,8")
     parser.add_argument("--num-inference-steps", type=int, default=50)
     return parser.parse_args()
@@ -115,15 +115,7 @@ def fp8_quantization_config(ignored_layers_csv: str) -> dict[str, Any]:
     return config
 
 
-def make_sampling_params(
-    *,
-    args: argparse.Namespace,
-    seeds: list[int],
-) -> OmniDiffusionSamplingParams:
-    generators = [
-        torch.Generator(device="cuda").manual_seed(seed)
-        for seed in seeds
-    ]
+def make_sampling_params(*, args: argparse.Namespace) -> OmniDiffusionSamplingParams:
     return OmniDiffusionSamplingParams(
         height=512,
         width=512,
@@ -131,7 +123,7 @@ def make_sampling_params(
         guidance_scale=0.0,
         true_cfg_scale=4.0,
         num_outputs_per_prompt=1,
-        generator=generators,
+        seed=SEED,
     )
 
 
@@ -144,8 +136,7 @@ def make_async_omni(
 ) -> AsyncOmni:
     kwargs: dict[str, Any] = {
         "stage_configs_path": str(stage_config_path),
-        "dtype": "bfloat16",
-        "batch_timeout": 0.2,
+        "batch_timeout": 2.0,
         "stage_init_timeout": 300,
         "init_timeout": 600,
         "master_port": 29500 + batch_size * 10 + (1 if engine_name == "fp8" else 0),
@@ -153,6 +144,17 @@ def make_async_omni(
     if engine_name == "fp8":
         kwargs["quantization_config"] = fp8_quantization_config("img_mlp")
     return AsyncOmni(model=args.model, **kwargs)
+
+
+def save_first_image(output: OmniRequestOutput, path: Path) -> str | None:
+    images = output.images
+    if not images and isinstance(output.request_output, OmniRequestOutput):
+        images = output.request_output.images
+    if not images:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    images[0].save(path)
+    return str(path)
 
 
 async def run_one_request(
@@ -174,17 +176,6 @@ async def run_one_request(
     return last_output
 
 
-def save_first_image(output: OmniRequestOutput, path: Path) -> str | None:
-    images = output.images
-    if not images and isinstance(output.request_output, OmniRequestOutput):
-        images = output.request_output.images
-    if not images:
-        return None
-    path.parent.mkdir(parents=True, exist_ok=True)
-    images[0].save(path)
-    return str(path)
-
-
 async def run_group(
     omni: AsyncOmni,
     *,
@@ -193,13 +184,12 @@ async def run_group(
     batch_size: int,
     group_index: int,
     prompts: list[str],
-    seeds: list[int],
     output_dir: Path,
 ) -> tuple[GroupRecord, list[RequestRecord]]:
-    sampling_params = make_sampling_params(args=args, seeds=seeds)
+    sampling_params = make_sampling_params(args=args)
     request_ids = [
-        f"{engine_name}-b{batch_size}-g{group_index}-i{i}-seed{seed}"
-        for i, seed in enumerate(seeds)
+        f"{engine_name}-b{batch_size}-g{group_index}-i{i}-seed{SEED}"
+        for i in range(len(prompts))
     ]
 
     start = time.perf_counter()
@@ -221,19 +211,19 @@ async def run_group(
         batch_size=batch_size,
         group_index=group_index,
         request_ids=request_ids,
-        seeds=seeds,
+        seed=SEED,
         latency_s=latency_s,
         throughput_img_s=len(prompts) / latency_s if latency_s > 0 else 0.0,
     )
 
     should_save_images = batch_size == 1
     records: list[RequestRecord] = []
-    for i, (prompt, seed, request_id, output) in enumerate(zip(prompts, seeds, request_ids, outputs, strict=True)):
+    for i, (prompt, request_id, output) in enumerate(zip(prompts, request_ids, outputs, strict=True)):
         image_path = None
         if should_save_images:
             image_path = save_first_image(
                 output,
-                output_dir / "images" / engine_name / f"{i:02d}_seed{seed}.png",
+                output_dir / "images" / engine_name / f"{i:02d}_seed{SEED}.png",
             )
         records.append(
             RequestRecord(
@@ -243,7 +233,7 @@ async def run_group(
                 request_index=i,
                 request_id=request_id,
                 prompt=prompt,
-                seed=seed,
+                seed=SEED,
                 latency_s=latency_s,
                 image_path=image_path,
             )
@@ -264,7 +254,6 @@ async def run_engine(
     requests: list[RequestRecord] = []
     for group_index, start in enumerate(range(0, len(PROMPTS), batch_size)):
         group_prompts = PROMPTS[start : start + batch_size]
-        group_seeds = SEEDS[start : start + batch_size]
         group, records = await run_group(
             omni,
             args=args,
@@ -272,7 +261,6 @@ async def run_engine(
             batch_size=batch_size,
             group_index=group_index,
             prompts=group_prompts,
-            seeds=group_seeds,
             output_dir=output_dir,
         )
         groups.append(group)
@@ -294,24 +282,24 @@ def close_omni(omni: AsyncOmni | None) -> None:
 async def run_batch_size(args: argparse.Namespace, batch_size: int, output_dir: Path) -> tuple[list[GroupRecord], list[RequestRecord]]:
     config_dir = output_dir / "stage_configs"
     config_dir.mkdir(parents=True, exist_ok=True)
-    fp16_config = config_dir / f"qwen_image_fp16_b{batch_size}.yaml"
+    bf16_config = config_dir / f"qwen_image_bf16_b{batch_size}.yaml"
     fp8_config = config_dir / f"qwen_image_fp8_b{batch_size}.yaml"
-    write_stage_config(fp16_config, devices=args.gpu, max_batch_size=batch_size)
+    write_stage_config(bf16_config, devices=args.gpu, max_batch_size=batch_size)
     write_stage_config(fp8_config, devices=args.gpu, max_batch_size=batch_size)
 
     all_groups: list[GroupRecord] = []
     all_requests: list[RequestRecord] = []
 
-    fp16_omni: AsyncOmni | None = None
+    bf16_omni: AsyncOmni | None = None
     fp8_omni: AsyncOmni | None = None
     try:
-        fp16_omni = make_async_omni(args=args, stage_config_path=fp16_config, engine_name="fp16", batch_size=batch_size)
+        bf16_omni = make_async_omni(args=args, stage_config_path=bf16_config, engine_name="bf16", batch_size=batch_size)
         fp8_omni = make_async_omni(args=args, stage_config_path=fp8_config, engine_name="fp8", batch_size=batch_size)
 
         groups, requests = await run_engine(
-            fp16_omni,
+            bf16_omni,
             args=args,
-            engine_name="fp16",
+            engine_name="bf16",
             batch_size=batch_size,
             output_dir=output_dir,
         )
@@ -328,7 +316,7 @@ async def run_batch_size(args: argparse.Namespace, batch_size: int, output_dir: 
         all_groups.extend(groups)
         all_requests.extend(requests)
     finally:
-        close_omni(fp16_omni)
+        close_omni(bf16_omni)
         close_omni(fp8_omni)
 
     return all_groups, all_requests
