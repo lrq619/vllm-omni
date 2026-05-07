@@ -71,7 +71,7 @@ class GroupRecord:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="/tmp/models/Qwen-Image")
+    parser.add_argument("--model", default="/tmp/models/Qwen/Qwen-Image")
     parser.add_argument("--output-dir", default="benchmarks/diffusion/qwen_image_fp8_results")
     parser.add_argument("--gpu", default="0", help="GPU id used by both BF16 and FP8 instances.")
     parser.add_argument("--batch-sizes", default="1,2,4,8")
