@@ -157,6 +157,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "args": args,
             "kwargs": kwargs,
             "output_rank": unique_reply_rank,
+            # Control-plane RPCs such as SP transitions must still execute on
+            # every worker even when only one rank is expected to reply.
+            "exec_all_ranks": unique_reply_rank is not None,
         }
 
         try:
@@ -171,7 +174,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 # Broadcast RPC request to all workers via unified message queue
                 self.scheduler.mq.enqueue(rpc_request)
 
-                # Determine which workers we expect responses from
+                # Determine which workers we expect responses from. For
+                # control-plane RPCs with a unique reply rank we still execute
+                # on all ranks, but only wait for the designated responder.
                 num_responses = 1 if unique_reply_rank is not None else self.od_config.num_gpus
 
                 responses = []
