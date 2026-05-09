@@ -11,6 +11,7 @@ import asyncio
 import os
 import sys
 import time
+import socket
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,12 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 MODEL_PATH = "/tmp/models/Qwen/Qwen-Image"
 PROMPT = "a photo of a cat sitting on a laptop keyboard"
 OUTPUT_DIR = Path("./output")
+
+
+def _get_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def _extract_single_image(outputs: list[OmniRequestOutput]) -> Image.Image:
@@ -97,6 +104,7 @@ async def _run_test_flow(tmp_output_dir: Path) -> None:
     engine = AsyncOmni(
         model=MODEL_PATH,
         parallel_config=DiffusionParallelConfig(ulysses_degree=2),
+        master_port=_get_free_port(),
         shm_threshold_bytes=sys.maxsize,
     )
     try:
