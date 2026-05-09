@@ -91,6 +91,49 @@ class Attention(nn.Module):
         # Fallback strategy when SP is not active (outside sharded regions)
         self._no_parallel_strategy = NoParallelAttention()
 
+    def refresh_sequence_parallel_state(self) -> None:
+        """Rebind cached SP state after the global process groups change.
+
+        This module caches the SP strategy objects at construction time. When the
+        worker tears down and recreates model-parallel groups, those cached
+        objects must be rebuilt so they point at the new process groups.
+        """
+        if not is_forward_context_available():
+            raise RuntimeError(
+                "Cannot refresh sequence-parallel attention state without an active forward context."
+            )
+
+        ctx = get_forward_context()
+        sp_size = getattr(ctx.omni_diffusion_config.parallel_config, "sequence_parallel_size", 1)
+
+        if sp_size <= 1:
+            self.use_ring = False
+            self.ring_pg = None
+            self.ring_runner = None
+            self.parallel_strategy = self._no_parallel_strategy
+            return
+
+        strategy = build_parallel_attention_strategy(
+            scatter_idx=self.scatter_idx,
+            gather_idx=self.gather_idx,
+            use_sync=self.use_sync,
+        )
+        if strategy.name == "none":
+            raise RuntimeError(
+                "Sequence parallelism is enabled in config, but the parallel attention strategy "
+                "could not be rebuilt."
+            )
+
+        self.parallel_strategy = strategy
+        self.use_ring = strategy.name == "ring"
+        if self.use_ring:
+            sp_group = get_sp_group()
+            self.ring_pg = sp_group.ring_group
+            self.ring_runner = strategy  # RingParallelAttention provides the runtime kernel path.
+        else:
+            self.ring_pg = None
+            self.ring_runner = None
+
     def _get_active_parallel_strategy(self):
         """Get the parallel strategy based on current SP active state.
 

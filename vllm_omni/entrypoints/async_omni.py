@@ -120,6 +120,9 @@ class AsyncOmni(OmniBase):
         # Request state tracking
         self.request_states: dict[str, ClientRequestState] = {}
         self.output_handler: asyncio.Task | None = None
+        self._sp_state_lock = asyncio.Lock()
+        self._sp_transition_in_progress = False
+        self._active_generate_requests = 0
 
         # RPC results storage: {stage_id: {rpc_id: result}}
         # Used to avoid race condition between output_handler and collective_rpc
@@ -291,6 +294,53 @@ class AsyncOmni(OmniBase):
 
             stage._rpc_result_checker = make_rpc_checker(sid)
 
+    async def _collect_stage_rpc(
+        self,
+        stages: Sequence[OmniStage],
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[list[_R]]:
+        """Run the same RPC across a selected set of stages.
+
+        This keeps the switch methods narrowly scoped to the diffusion stage
+        instead of broadcasting through the whole multi-stage pipeline.
+        """
+        self._run_output_handler()
+        loop = asyncio.get_event_loop()
+
+        async def run_stage_rpc(stage: OmniStage) -> _R:
+            return await loop.run_in_executor(
+                None,
+                stage.collective_rpc,
+                method,
+                timeout,
+                args,
+                kwargs,
+            )
+
+        return list(await asyncio.gather(*[run_stage_rpc(stage) for stage in stages]))
+
+    async def _collect_diffusion_stage_rpc(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[list[_R]]:
+        diffusion_stages = [stage for stage in self.stage_list if getattr(stage, "stage_type", None) == "diffusion"]
+        if not diffusion_stages:
+            raise RuntimeError("SP switch requested, but no diffusion stages are available.")
+
+        logger.info(
+            "[%s] Broadcasting %s to diffusion stage(s): %s",
+            self._name,
+            getattr(method, "__name__", method),
+            [stage.stage_id for stage in diffusion_stages],
+        )
+        return await self._collect_stage_rpc(diffusion_stages, method, timeout=timeout, args=args, kwargs=kwargs)
+
     def shutdown(self):
         """Shutdown, cleaning up the background proc and IPC.
 
@@ -336,6 +386,13 @@ class AsyncOmni(OmniBase):
         # Wait until generation is resumed if the engine is paused.
         async with self._pause_cond:
             await self._pause_cond.wait_for(lambda: not self._paused)
+
+        counted_generate_request = False
+        async with self._sp_state_lock:
+            if self._sp_transition_in_progress:
+                raise RuntimeError("Cannot generate while an SP transition is in progress.")
+            self._active_generate_requests += 1
+            counted_generate_request = True
 
         logger.debug(f"[{self._name}] generate() called")
         try:
@@ -427,6 +484,12 @@ class AsyncOmni(OmniBase):
             await self.abort(request_id)
             logger.info("[AsyncOrchestrator] Request %s aborted.", request_id)
             raise
+        finally:
+            if counted_generate_request:
+                async with self._sp_state_lock:
+                    if self._active_generate_requests <= 0:
+                        raise RuntimeError("Internal generate accounting went negative.")
+                    self._active_generate_requests -= 1
 
     async def _process_async_results(
         self,
@@ -801,36 +864,107 @@ class AsyncOmni(OmniBase):
         results = await asyncio.gather(*[run_stage_rpc(stage) for stage in self.stage_list])
         return list(results)
 
+    async def _run_locked_control_plane_rpc(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        """Run a control-plane RPC only when SP switching and generation are idle."""
+        async with self._sp_state_lock:
+            if self._sp_transition_in_progress:
+                raise RuntimeError(f"Cannot run {getattr(method, '__name__', method)} while an SP transition is active.")
+            if self._active_generate_requests != 0:
+                raise RuntimeError(
+                    f"Cannot run {getattr(method, '__name__', method)} while {self._active_generate_requests} request(s) are in flight."
+                )
+            return await self.collective_rpc(method=method, timeout=timeout, args=args, kwargs=kwargs)
+
     async def sleep(self, level: int = 1) -> None:
+        await self._run_locked_control_plane_rpc(method="sleep", args=(level,))
         self._is_sleeping = True
-        await self.collective_rpc(method="sleep", args=(level,))
 
     async def wake_up(self, tags: list[str] | None = None) -> None:
+        await self._run_locked_control_plane_rpc(method="wake_up", args=(tags,))
         self._is_sleeping = False
-        await self.collective_rpc(method="wake_up", args=(tags,))
 
     async def is_sleeping(self) -> bool:
         """Check whether the engine is sleeping"""
         return getattr(self, "_is_sleeping", False)
 
+    async def _run_sp_transition(self, worker_method: str, target_sp_size: int) -> None:
+        """Run a strict SP transition on diffusion stages only."""
+        logger.info("[%s] Requesting SP transition to SP=%d via %s.", self._name, target_sp_size, worker_method)
+        rollback_method = "extend_sp_two" if worker_method == "shrink_sp_one" else "shrink_sp_one"
+        async with self._sp_state_lock:
+            if self._sp_transition_in_progress:
+                raise RuntimeError("Cannot change SP while another SP transition is already running.")
+            if self._active_generate_requests != 0:
+                raise RuntimeError(
+                    f"Cannot change SP while {self._active_generate_requests} request(s) are still in flight."
+                )
+            self._sp_transition_in_progress = True
+
+        try:
+            stage_results = await self._collect_diffusion_stage_rpc(method=worker_method)
+            for idx, worker_results in enumerate(stage_results):
+                if not all(result is True for result in worker_results):
+                    raise RuntimeError(
+                        f"SP transition '{worker_method}' failed on diffusion stage index {idx}: {worker_results}"
+                    )
+            logger.info("[%s] SP transition %s completed successfully.", self._name, worker_method)
+        except Exception:
+            logger.exception("[%s] SP transition %s failed; rolling back to %s.", self._name, worker_method, rollback_method)
+            try:
+                rollback_results = await self._collect_diffusion_stage_rpc(method=rollback_method, kwargs={"force": True})
+                for idx, worker_results in enumerate(rollback_results):
+                    if not all(result is True for result in worker_results):
+                        raise RuntimeError(
+                            f"Rollback transition '{rollback_method}' failed on diffusion stage index {idx}: {worker_results}"
+                        )
+                logger.info("[%s] SP rollback %s completed successfully.", self._name, rollback_method)
+            except Exception as rollback_exc:
+                logger.exception(
+                    "[%s] SP rollback %s also failed after %s failure.",
+                    self._name,
+                    rollback_method,
+                    worker_method,
+                )
+                raise RuntimeError(
+                    f"SP transition '{worker_method}' failed and rollback '{rollback_method}' also failed."
+                ) from rollback_exc
+            raise
+        finally:
+            async with self._sp_state_lock:
+                self._sp_transition_in_progress = False
+
+    async def shrink_sp_one(self) -> None:
+        """Switch the diffusion stage from SP=2 to SP=1."""
+        await self._run_sp_transition("shrink_sp_one", target_sp_size=1)
+
+    async def extend_sp_two(self) -> None:
+        """Switch the diffusion stage from SP=1 back to SP=2."""
+        await self._run_sp_transition("extend_sp_two", target_sp_size=2)
+
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
-        result = await self.collective_rpc(method="add_lora", args=(lora_request,))
+        result = await self._run_locked_control_plane_rpc(method="add_lora", args=(lora_request,))
         return result[0][0]
 
     async def remove_lora(self, adapter_id: int) -> bool:
         """Remove a LoRA adapter from the engine."""
-        result = await self.collective_rpc(method="remove_lora", args=(adapter_id,))
+        result = await self._run_locked_control_plane_rpc(method="remove_lora", args=(adapter_id,))
         return result[0][0]
 
     async def list_loras(self) -> list[int]:
         """List all loaded LoRA adapter IDs."""
-        result = await self.collective_rpc(method="list_loras")
+        result = await self._run_locked_control_plane_rpc(method="list_loras")
         return result[0][0]
 
     async def pin_lora(self, adapter_id: int) -> bool:
         """Pin a LoRA adapter so it is not evicted from the cache."""
-        result = await self.collective_rpc(method="pin_lora", args=(adapter_id,))
+        result = await self._run_locked_control_plane_rpc(method="pin_lora", args=(adapter_id,))
         return result[0][0]
 
     async def encode(

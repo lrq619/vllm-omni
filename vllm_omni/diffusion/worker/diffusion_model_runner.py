@@ -16,7 +16,7 @@ from contextlib import nullcontext
 
 import torch
 from torch.profiler import record_function
-from vllm.config import LoadConfig
+from vllm.config import LoadConfig, VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
@@ -174,6 +174,43 @@ class DiffusionModelRunner:
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights into the pipeline."""
         return self.pipeline.load_weights(weights)
+
+    def refresh_sequence_parallel_state(
+        self,
+        od_config: OmniDiffusionConfig | None = None,
+        vllm_config: VllmConfig | None = None,
+    ) -> None:
+        """Refresh cached SP-aware modules after the global groups change.
+
+        The caller may provide temporary config snapshots when it needs to
+        validate a prospective SP layout before committing the worker state.
+        """
+        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+
+        active_od_config = od_config or self.od_config
+        active_vllm_config = vllm_config or self.vllm_config
+        refreshed_modules = 0
+        with set_forward_context(vllm_config=active_vllm_config, omni_diffusion_config=active_od_config):
+            with set_current_vllm_config(active_vllm_config):
+                for module in self.pipeline.modules():
+                    if hasattr(module, "od_config"):
+                        module.od_config = active_od_config
+                    if hasattr(module, "vllm_config"):
+                        module.vllm_config = active_vllm_config
+                    if hasattr(module, "parallel_config"):
+                        module.parallel_config = active_od_config.parallel_config
+                    refresh = getattr(module, "refresh_sequence_parallel_state", None)
+                    if callable(refresh):
+                        refresh()
+                        refreshed_modules += 1
+
+        if refreshed_modules == 0:
+            raise RuntimeError(
+                f"Sequence parallel state refresh requested for {self.od_config.model_class_name}, "
+                "but no modules expose refresh_sequence_parallel_state()."
+            )
+
+        logger.info("Refreshed sequence-parallel state on %d module(s).", refreshed_modules)
 
     def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """

@@ -8,6 +8,7 @@ Handles GPU infrastructure initialization and delegates model operations
 to DiffusionModelRunner.
 """
 
+import copy
 import gc
 import multiprocessing as mp
 import os
@@ -32,6 +33,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
     init_distributed_environment,
     initialize_model_parallel,
+    reinitialize_model_parallel,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
@@ -73,6 +75,9 @@ class DiffusionWorker:
         self.model_runner: DiffusionModelRunner | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
+        self._base_parallel_config = copy.deepcopy(self.od_config.parallel_config)
+        self._sp_runtime_mode = self._base_parallel_config.sequence_parallel_size
+        self._sp_primary_only = False
         self.init_device()
         # Create model runner
         self.model_runner = DiffusionModelRunner(
@@ -181,6 +186,12 @@ class DiffusionWorker:
     def execute_model(self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
+        if self._sp_primary_only:
+            logger.info(
+                "Worker %d is in SP standby mode; skipping diffusion execution for this request.",
+                self.rank,
+            )
+            return DiffusionOutput()
         if self.lora_manager is not None:
             try:
                 self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
@@ -195,6 +206,135 @@ class DiffusionWorker:
         assert self.model_runner is not None, "Model runner not initialized"
         return self.model_runner.load_weights(weights)
 
+    def _refresh_sequence_parallel_state(
+        self,
+        od_config: OmniDiffusionConfig | None = None,
+        vllm_config: VllmConfig | None = None,
+    ) -> None:
+        """Refresh cached SP-aware modules after model-parallel groups change."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        self.model_runner.refresh_sequence_parallel_state(
+            od_config=od_config or self.od_config,
+            vllm_config=vllm_config or self.vllm_config,
+        )
+
+    def _apply_sequence_parallel_mode(self, target_sp_size: int, force: bool = False) -> bool:
+        """Switch the worker between the supported SP runtime modes.
+
+        This implementation is intentionally strict:
+        - It only supports the 2-worker layout used by AsyncOmni.
+        - It tears down and rebuilds the model-parallel groups.
+        - It fails fast if the stored bootstrap configuration is incompatible.
+        """
+        assert self.model_runner is not None, "Model runner not initialized"
+
+        if target_sp_size not in (1, 2):
+            raise RuntimeError(f"Unsupported SP target size: {target_sp_size}")
+
+        if self._sp_runtime_mode == target_sp_size and not force:
+            raise RuntimeError(f"Sequence parallel mode is already SP={target_sp_size}.")
+
+        if self.od_config.num_gpus != 2:
+            raise RuntimeError(
+                f"Dynamic SP switching only supports 2 workers, but got num_gpus={self.od_config.num_gpus}."
+            )
+
+        base = self._base_parallel_config
+        if base.sequence_parallel_size != 2:
+            raise RuntimeError(
+                f"Dynamic SP switching requires the initial SP size to be 2, but got {base.sequence_parallel_size}."
+            )
+        if any(
+            value != 1
+            for value in (
+                base.tensor_parallel_size,
+                base.pipeline_parallel_size,
+                base.cfg_parallel_size,
+            )
+        ):
+            raise RuntimeError(
+                "Dynamic SP switching currently requires tensor/pipeline/cfg parallel sizes to be 1."
+            )
+        if getattr(base, "use_hsdp", False):
+            raise RuntimeError("Dynamic SP switching does not support HSDP.")
+
+        current_parallel_config = copy.deepcopy(self.od_config.parallel_config)
+        if target_sp_size == 1:
+            new_parallel_config = copy.deepcopy(base)
+            new_parallel_config.sequence_parallel_size = 1
+            new_parallel_config.ulysses_degree = 1
+            new_parallel_config.ring_degree = 1
+            new_parallel_config.data_parallel_size = self.od_config.num_gpus
+            new_parallel_config.world_size = self.od_config.num_gpus
+            standby_mode = self.rank != 0
+            logger.info(
+                "Worker %d: shrinking sequence parallelism to SP=1; primary_only=%s",
+                self.rank,
+                standby_mode,
+            )
+        else:
+            new_parallel_config = copy.deepcopy(base)
+            standby_mode = False
+            logger.info("Worker %d: extending sequence parallelism back to SP=2", self.rank)
+
+        candidate_od_config = copy.deepcopy(self.od_config)
+        candidate_od_config.parallel_config = new_parallel_config
+        candidate_vllm_config = copy.deepcopy(self.vllm_config)
+        candidate_vllm_config.parallel_config.data_parallel_size = new_parallel_config.data_parallel_size
+        if hasattr(candidate_vllm_config.parallel_config, "sequence_parallel_size"):
+            candidate_vllm_config.parallel_config.sequence_parallel_size = new_parallel_config.sequence_parallel_size
+
+        try:
+            reinitialize_model_parallel(
+                data_parallel_size=new_parallel_config.data_parallel_size,
+                cfg_parallel_size=new_parallel_config.cfg_parallel_size,
+                sequence_parallel_size=new_parallel_config.sequence_parallel_size,
+                ulysses_degree=new_parallel_config.ulysses_degree,
+                ring_degree=new_parallel_config.ring_degree,
+                tensor_parallel_size=new_parallel_config.tensor_parallel_size,
+                pipeline_parallel_size=new_parallel_config.pipeline_parallel_size,
+                fully_shard_degree=new_parallel_config.hsdp_shard_size if new_parallel_config.use_hsdp else 1,
+            )
+
+            # Rebind cached attention/SP state on the candidate config before we
+            # commit it. If this fails, the worker is rolled back to the previous
+            # model-parallel state instead of being left half-switched.
+            self._refresh_sequence_parallel_state(od_config=candidate_od_config, vllm_config=candidate_vllm_config)
+        except Exception:
+            logger.exception(
+                "Worker %d: SP transition to SP=%d failed; attempting rollback.",
+                self.rank,
+                target_sp_size,
+            )
+            try:
+                reinitialize_model_parallel(
+                    data_parallel_size=current_parallel_config.data_parallel_size,
+                    cfg_parallel_size=current_parallel_config.cfg_parallel_size,
+                    sequence_parallel_size=current_parallel_config.sequence_parallel_size,
+                    ulysses_degree=current_parallel_config.ulysses_degree,
+                    ring_degree=current_parallel_config.ring_degree,
+                    tensor_parallel_size=current_parallel_config.tensor_parallel_size,
+                    pipeline_parallel_size=current_parallel_config.pipeline_parallel_size,
+                    fully_shard_degree=current_parallel_config.hsdp_shard_size if current_parallel_config.use_hsdp else 1,
+                )
+                self._refresh_sequence_parallel_state()
+            except Exception:
+                logger.exception(
+                    "Worker %d: rollback after failed SP transition also failed.",
+                    self.rank,
+                )
+            raise
+
+        self.od_config = candidate_od_config
+        self.vllm_config = candidate_vllm_config
+        assert self.model_runner is not None, "Model runner not initialized"
+        self.model_runner.od_config = self.od_config
+        self.model_runner.vllm_config = self.vllm_config
+
+        self._sp_primary_only = standby_mode
+        self._sp_runtime_mode = target_sp_size
+        return True
+
     def remove_lora(self, adapter_id: int) -> bool:
         return self.lora_manager.remove_adapter(adapter_id)
 
@@ -208,6 +348,14 @@ class DiffusionWorker:
 
     def pin_lora(self, adapter_id: int) -> bool:
         return self.lora_manager.pin_adapter(adapter_id)
+
+    def shrink_sp_one(self, force: bool = False) -> bool:
+        """Reduce sequence parallelism from SP=2 to SP=1."""
+        return self._apply_sequence_parallel_mode(1, force=force)
+
+    def extend_sp_two(self, force: bool = False) -> bool:
+        """Restore sequence parallelism from SP=1 back to the original SP=2."""
+        return self._apply_sequence_parallel_mode(2, force=force)
 
     def sleep(self, level: int = 1) -> bool:
         """

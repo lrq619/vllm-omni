@@ -858,6 +858,46 @@ def destroy_model_parallel():
         _FS.destroy()
     _FS = None
 
+    global _DIT
+    if _DIT is not None:
+        try:
+            torch.distributed.destroy_process_group(_DIT)
+        except Exception:
+            logger.debug("Failed to destroy DIT process group cleanly.", exc_info=True)
+    _DIT = None
+
+
+def reinitialize_model_parallel(
+    data_parallel_size: int = 1,
+    cfg_parallel_size: int = 1,
+    sequence_parallel_size: int | None = None,
+    ulysses_degree: int = 1,
+    ring_degree: int = 1,
+    tensor_parallel_size: int = 1,
+    pipeline_parallel_size: int = 1,
+    fully_shard_degree: int = 1,
+    backend: str | None = None,
+) -> None:
+    """Rebuild model-parallel groups from scratch.
+
+    This helper is intentionally strict: it tears down all existing model-parallel
+    groups first, then recreates them from the supplied configuration.
+    Callers must ensure no in-flight work is using the old groups.
+    """
+
+    destroy_model_parallel()
+    initialize_model_parallel(
+        data_parallel_size=data_parallel_size,
+        cfg_parallel_size=cfg_parallel_size,
+        sequence_parallel_size=sequence_parallel_size,
+        ulysses_degree=ulysses_degree,
+        ring_degree=ring_degree,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        fully_shard_degree=fully_shard_degree,
+        backend=backend,
+    )
+
 
 def destroy_distributed_environment():
     global _WORLD
