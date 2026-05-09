@@ -991,11 +991,13 @@ def _stage_worker(
             rpc_args = task.get("args", ())
             rpc_kwargs = task.get("kwargs") or {}
             try:
+                unique_reply_rank = 0 if rpc_method in {"shrink_sp_one", "extend_sp_two"} else None
                 rpc_result = stage_engine.collective_rpc(
                     method=rpc_method,
                     timeout=rpc_timeout,
                     args=rpc_args,
                     kwargs=rpc_kwargs,
+                    unique_reply_rank=unique_reply_rank,
                 )
                 out_q.put(
                     {
@@ -1570,6 +1572,7 @@ async def _stage_worker_async(
                     if stage_type == "diffusion":
                         # DiffusionEngine.collective_rpc is synchronous
                         loop = asyncio.get_event_loop()
+                        unique_reply_rank = 0 if rpc_method in {"shrink_sp_one", "extend_sp_two"} else None
                         rpc_result = await loop.run_in_executor(
                             None,
                             lambda: stage_engine.engine.collective_rpc(
@@ -1577,6 +1580,7 @@ async def _stage_worker_async(
                                 timeout=rpc_timeout,
                                 args=rpc_args,
                                 kwargs=rpc_kwargs,
+                                unique_reply_rank=unique_reply_rank,
                             ),
                         )
                     else:
