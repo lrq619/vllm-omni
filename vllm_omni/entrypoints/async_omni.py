@@ -311,7 +311,13 @@ class AsyncOmni(OmniBase):
         loop = asyncio.get_event_loop()
 
         async def run_stage_rpc(stage: OmniStage) -> _R:
-            return await loop.run_in_executor(
+            logger.info(
+                "[%s] collective_rpc dispatch stage_id=%s method=%s",
+                self._name,
+                stage.stage_id,
+                getattr(method, "__name__", method),
+            )
+            result = await loop.run_in_executor(
                 None,
                 stage.collective_rpc,
                 method,
@@ -319,6 +325,13 @@ class AsyncOmni(OmniBase):
                 args,
                 kwargs,
             )
+            logger.info(
+                "[%s] collective_rpc completed stage_id=%s method=%s",
+                self._name,
+                stage.stage_id,
+                getattr(method, "__name__", method),
+            )
+            return result
 
         return list(await asyncio.gather(*[run_stage_rpc(stage) for stage in stages]))
 
@@ -339,7 +352,14 @@ class AsyncOmni(OmniBase):
             getattr(method, "__name__", method),
             [stage.stage_id for stage in diffusion_stages],
         )
-        return await self._collect_stage_rpc(diffusion_stages, method, timeout=timeout, args=args, kwargs=kwargs)
+        results = await self._collect_stage_rpc(diffusion_stages, method, timeout=timeout, args=args, kwargs=kwargs)
+        logger.info(
+            "[%s] Diffusion-stage RPC %s returned with %d stage result group(s).",
+            self._name,
+            getattr(method, "__name__", method),
+            len(results),
+        )
+        return results
 
     def shutdown(self):
         """Shutdown, cleaning up the background proc and IPC.
@@ -715,6 +735,12 @@ class AsyncOmni(OmniBase):
                         # race condition with the polling in collective_rpc
                         if result.get("type") == "collective_rpc_result":
                             rpc_id = result.get("rpc_id")
+                            logger.info(
+                                "[%s] output_handler received collective_rpc_result stage_id=%s rpc_id=%s",
+                                self._name,
+                                stage_id,
+                                rpc_id,
+                            )
                             if rpc_id:
                                 if stage_id not in self._rpc_results:
                                     self._rpc_results[stage_id] = {}
@@ -916,6 +942,12 @@ class AsyncOmni(OmniBase):
 
         try:
             stage_results = await self._collect_diffusion_stage_rpc(method=worker_method)
+            logger.info(
+                "[%s] SP transition RPC returned for %s with %d stage result group(s).",
+                self._name,
+                worker_method,
+                len(stage_results),
+            )
             for idx, worker_results in enumerate(stage_results):
                 if not all(result is True for result in worker_results):
                     raise RuntimeError(
