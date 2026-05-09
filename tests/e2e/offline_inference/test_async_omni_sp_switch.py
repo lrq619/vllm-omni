@@ -80,6 +80,7 @@ async def _run_generate_and_save(
     print(f"[{label}] starting generate request_id={request_id}")
     start = time.perf_counter()
     last_output: OmniRequestOutput | None = None
+    omni_output: OmniRequestOutput | None = None
     async for omni_output in engine.generate(
         prompt=prompt,
         request_id=request_id,
@@ -98,11 +99,13 @@ async def _run_generate_and_save(
 
     # Release the output object promptly so the next request can reuse IPC/shm
     # resources before we start the next generation phase.
+    del omni_output
     del last_output
     del image
     gc.collect()
     current_omni_platform.empty_cache()
     current_omni_platform.synchronize()
+    print(f"[{label}] released output references and completed cleanup")
     return elapsed_s
 
 

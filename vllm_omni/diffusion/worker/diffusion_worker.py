@@ -576,6 +576,16 @@ class WorkerProc:
             msg = None
             try:
                 msg = self.recv_message()
+                msg_type = msg.get("type") if isinstance(msg, dict) else type(msg).__name__
+                req_id = msg.get("request_id") if isinstance(msg, dict) else None
+                logger.info(
+                    "Worker %d: dequeued message type=%s request_id=%s standby=%s sp_mode=%s",
+                    self.gpu_id,
+                    msg_type,
+                    req_id,
+                    self._sp_primary_only,
+                    self._sp_runtime_mode,
+                )
             except Exception as e:
                 logger.error(
                     f"Error receiving message in worker loop: {e}",
@@ -615,7 +625,18 @@ class WorkerProc:
                     output = DiffusionOutput(error=str(e))
 
                 try:
+                    logger.info(
+                        "Worker %d: sending result request_id=%s output_type=%s",
+                        self.gpu_id,
+                        msg.get("request_id") if isinstance(msg, dict) else None,
+                        type(output).__name__,
+                    )
                     self.return_result(output)
+                    logger.info(
+                        "Worker %d: sent result request_id=%s",
+                        self.gpu_id,
+                        msg.get("request_id") if isinstance(msg, dict) else None,
+                    )
                 except zmq.ZMQError as e:
                     logger.error(f"ZMQ error sending reply: {e}")
                     continue
