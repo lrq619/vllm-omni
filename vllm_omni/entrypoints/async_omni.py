@@ -948,20 +948,20 @@ class AsyncOmni(OmniBase):
                 worker_method,
                 len(stage_results),
             )
-            for idx, worker_results in enumerate(stage_results):
-                if not all(result is True for result in worker_results):
+            for idx, stage_result in enumerate(stage_results):
+                if stage_result is not True:
                     raise RuntimeError(
-                        f"SP transition '{worker_method}' failed on diffusion stage index {idx}: {worker_results}"
+                        f"SP transition '{worker_method}' failed on diffusion stage index {idx}: {stage_result}"
                     )
             logger.info("[%s] SP transition %s completed successfully.", self._name, worker_method)
         except Exception:
             logger.exception("[%s] SP transition %s failed; rolling back to %s.", self._name, worker_method, rollback_method)
             try:
                 rollback_results = await self._collect_diffusion_stage_rpc(method=rollback_method, kwargs={"force": True})
-                for idx, worker_results in enumerate(rollback_results):
-                    if not all(result is True for result in worker_results):
+                for idx, stage_result in enumerate(rollback_results):
+                    if stage_result is not True:
                         raise RuntimeError(
-                            f"Rollback transition '{rollback_method}' failed on diffusion stage index {idx}: {worker_results}"
+                            f"Rollback transition '{rollback_method}' failed on diffusion stage index {idx}: {stage_result}"
                         )
                 logger.info("[%s] SP rollback %s completed successfully.", self._name, rollback_method)
             except Exception as rollback_exc:
