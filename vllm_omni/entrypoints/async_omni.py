@@ -394,7 +394,7 @@ class AsyncOmni(OmniBase):
             self._active_generate_requests += 1
             counted_generate_request = True
 
-        logger.debug(f"[{self._name}] generate() called")
+        logger.info("[%s] generate start request_id=%s", self._name, request_id)
         try:
             # Start output handler on the first call to generate()
             self._run_output_handler()
@@ -435,7 +435,9 @@ class AsyncOmni(OmniBase):
                 "engine_inputs": prompt,
                 "sampling_params": sp0,
             }
+            logger.info("[%s] submitting request %s to stage-0", self._name, request_id)
             self.stage_list[0].submit(task)
+            logger.info("[%s] request %s submitted to stage-0", self._name, request_id)
             metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
             _req_start_ts[request_id] = time.time()
             logger.info(
@@ -490,6 +492,12 @@ class AsyncOmni(OmniBase):
                     if self._active_generate_requests <= 0:
                         raise RuntimeError("Internal generate accounting went negative.")
                     self._active_generate_requests -= 1
+                    logger.info(
+                        "[%s] generate finished request_id=%s remaining_active=%d",
+                        self._name,
+                        request_id,
+                        self._active_generate_requests,
+                    )
 
     async def _process_async_results(
         self,

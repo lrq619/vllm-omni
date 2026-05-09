@@ -45,6 +45,12 @@ class Scheduler:
 
     def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         """Sends a request to the scheduler and waits for the response."""
+        request_id = request.request_ids[0] if request.request_ids else ""
+        logger.info(
+            "Scheduler.add_req start request_id=%s num_workers=%d",
+            request_id,
+            self.num_workers,
+        )
         with self._lock:
             try:
                 # Prepare RPC request for generation
@@ -58,13 +64,17 @@ class Scheduler:
                 }
 
                 # Broadcast RPC request to all workers
+                logger.info("Scheduler.add_req broadcasting generate RPC request_id=%s", request_id)
                 self.mq.enqueue(rpc_request)
+                logger.info("Scheduler.add_req broadcast complete request_id=%s", request_id)
                 # Wait for result from Rank 0 (or whoever sends it)
 
                 if self.result_mq is None:
                     raise RuntimeError("Result queue not initialized")
 
+                logger.info("Scheduler.add_req waiting for result request_id=%s", request_id)
                 output = self.result_mq.dequeue()
+                logger.info("Scheduler.add_req received result request_id=%s type=%s", request_id, type(output).__name__)
                 # {"status": "error", "error": str(e)}
                 if isinstance(output, dict) and output.get("status") == "error":
                     raise RuntimeError("worker error")

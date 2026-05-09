@@ -67,6 +67,13 @@ class DiffusionEngine:
             raise e
 
     def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
+        request_id = request.request_ids[0] if request.request_ids else ""
+        logger.info(
+            "DiffusionEngine.step begin request_id=%s prompts=%d steps=%s",
+            request_id,
+            len(request.prompts),
+            request.sampling_params.num_inference_steps,
+        )
         # Apply pre-processing if available
         if self.pre_process_func is not None:
             preprocess_start_time = time.time()
@@ -74,7 +81,9 @@ class DiffusionEngine:
             preprocess_time = time.time() - preprocess_start_time
             logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
 
+        logger.info("DiffusionEngine.step waiting for scheduler response request_id=%s", request_id)
         output = self.add_req_and_wait_for_response(request)
+        logger.info("DiffusionEngine.step received scheduler response request_id=%s", request_id)
         if output.error:
             raise Exception(f"{output.error}")
         logger.info("Generation completed successfully.")
@@ -218,6 +227,8 @@ class DiffusionEngine:
         return DiffusionEngine(config)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest):
+        request_id = request.request_ids[0] if request.request_ids else ""
+        logger.info("DiffusionEngine.add_req_and_wait_for_response start request_id=%s", request_id)
         return self.executor.add_req(request)
 
     def start_profile(self, trace_filename: str | None = None) -> None:
@@ -392,6 +403,12 @@ class DiffusionEngine:
             Single result if unique_reply_rank is provided, otherwise list of results
         """
         assert isinstance(method, str), "Only string method names are supported for now"
+        logger.info(
+            "DiffusionEngine.collective_rpc start method=%s timeout=%s unique_reply_rank=%s",
+            method,
+            timeout,
+            unique_reply_rank,
+        )
         return self.executor.collective_rpc(
             method=method,
             timeout=timeout,

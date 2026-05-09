@@ -259,6 +259,13 @@ class DiffusionWorker:
             raise RuntimeError("Dynamic SP switching does not support HSDP.")
 
         current_parallel_config = copy.deepcopy(self.od_config.parallel_config)
+        logger.info(
+            "Worker %d: starting SP transition target=%d force=%s current_sp=%d",
+            self.rank,
+            target_sp_size,
+            force,
+            self._sp_runtime_mode,
+        )
         if target_sp_size == 1:
             new_parallel_config = copy.deepcopy(base)
             new_parallel_config.sequence_parallel_size = 1
@@ -285,6 +292,7 @@ class DiffusionWorker:
             candidate_vllm_config.parallel_config.sequence_parallel_size = new_parallel_config.sequence_parallel_size
 
         try:
+            logger.info("Worker %d: rebuilding model-parallel groups for SP=%d", self.rank, target_sp_size)
             reinitialize_model_parallel(
                 data_parallel_size=new_parallel_config.data_parallel_size,
                 cfg_parallel_size=new_parallel_config.cfg_parallel_size,
@@ -295,11 +303,14 @@ class DiffusionWorker:
                 pipeline_parallel_size=new_parallel_config.pipeline_parallel_size,
                 fully_shard_degree=new_parallel_config.hsdp_shard_size if new_parallel_config.use_hsdp else 1,
             )
+            logger.info("Worker %d: model-parallel groups rebuilt for SP=%d", self.rank, target_sp_size)
 
             # Rebind cached attention/SP state on the candidate config before we
             # commit it. If this fails, the worker is rolled back to the previous
             # model-parallel state instead of being left half-switched.
+            logger.info("Worker %d: refreshing cached SP-aware modules for SP=%d", self.rank, target_sp_size)
             self._refresh_sequence_parallel_state(od_config=candidate_od_config, vllm_config=candidate_vllm_config)
+            logger.info("Worker %d: cached SP-aware modules refreshed for SP=%d", self.rank, target_sp_size)
         except Exception:
             logger.exception(
                 "Worker %d: SP transition to SP=%d failed; attempting rollback.",
@@ -333,6 +344,12 @@ class DiffusionWorker:
 
         self._sp_primary_only = standby_mode
         self._sp_runtime_mode = target_sp_size
+        logger.info(
+            "Worker %d: SP transition committed target=%d standby=%s",
+            self.rank,
+            target_sp_size,
+            standby_mode,
+        )
         return True
 
     def remove_lora(self, adapter_id: int) -> bool:
