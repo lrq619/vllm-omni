@@ -578,13 +578,15 @@ class WorkerProc:
                 msg = self.recv_message()
                 msg_type = msg.get("type") if isinstance(msg, dict) else type(msg).__name__
                 req_id = msg.get("request_id") if isinstance(msg, dict) else None
+                standby_mode = getattr(self.worker, "_sp_primary_only", False)
+                sp_runtime_mode = getattr(self.worker, "_sp_runtime_mode", None)
                 logger.info(
                     "Worker %d: dequeued message type=%s request_id=%s standby=%s sp_mode=%s",
                     self.gpu_id,
                     msg_type,
                     req_id,
-                    self._sp_primary_only,
-                    self._sp_runtime_mode,
+                    standby_mode,
+                    sp_runtime_mode,
                 )
             except Exception as e:
                 logger.error(
