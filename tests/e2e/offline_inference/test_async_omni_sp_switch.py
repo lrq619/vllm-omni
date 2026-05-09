@@ -52,16 +52,10 @@ def _extract_single_image(outputs: list[OmniRequestOutput]) -> Image.Image:
     first_output = outputs[-1]
     if first_output.final_output_type != "image":
         raise ValueError(f"Expected final output type 'image', got {first_output.final_output_type!r}")
-    if not hasattr(first_output, "request_output") or not first_output.request_output:
-        raise ValueError("No request_output found in OmniRequestOutput")
-
-    req_out = first_output.request_output[0]
-    if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
-        raise ValueError("Invalid request_output structure or missing 'images' field")
-    if not req_out.images:
+    if not first_output.images:
         raise ValueError("No images returned by AsyncOmni.generate()")
 
-    image = req_out.images[0]
+    image = first_output.images[0]
     if not isinstance(image, Image.Image):
         raise TypeError(f"Expected PIL.Image.Image, got {type(image)!r}")
     return image
