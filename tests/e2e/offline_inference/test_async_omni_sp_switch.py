@@ -4,7 +4,8 @@
 """Minimal smoke test for AsyncOmni SP switching.
 
 This test starts AsyncOmni with SP=2, runs one generation, shrinks to SP=1,
-runs a second generation, and saves both images under ./output.
+runs a second generation, extends back to SP=2, runs a third generation, and
+saves all images under ./output.
 """
 
 import asyncio
@@ -119,6 +120,7 @@ async def _run_test_flow(tmp_output_dir: Path) -> None:
     try:
         sp2_path = tmp_output_dir / "sp2.png"
         sp1_path = tmp_output_dir / "sp1.png"
+        sp2_roundtrip_path = tmp_output_dir / "sp2_roundtrip.png"
 
         print("[SP smoke] phase=sp2 begin")
         sp2_time_s = await _run_generate_and_save(
@@ -143,6 +145,23 @@ async def _run_test_flow(tmp_output_dir: Path) -> None:
             label="SP=1",
         )
         print(f"[SP=1] generate took {sp1_time_s:.3f}s, saved to {sp1_path}")
+
+        print("[SP smoke] phase=extend begin")
+        await engine.extend_sp_two()
+        print("[SP smoke] phase=extend done")
+
+        print("[SP smoke] phase=sp2_roundtrip begin")
+        sp2_roundtrip_time_s = await _run_generate_and_save(
+            engine,
+            prompt=PROMPT,
+            request_id="sp2-roundtrip-request",
+            output_path=sp2_roundtrip_path,
+            label="SP=2-roundtrip",
+        )
+        print(
+            f"[SP=2-roundtrip] generate took {sp2_roundtrip_time_s:.3f}s, "
+            f"saved to {sp2_roundtrip_path}"
+        )
     finally:
         engine.shutdown()
         cleanup_dist_env_and_memory()
