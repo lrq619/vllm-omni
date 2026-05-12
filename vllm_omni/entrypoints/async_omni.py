@@ -120,7 +120,7 @@ class AsyncOmni(OmniBase):
         # Request state tracking
         self.request_states: dict[str, ClientRequestState] = {}
         self.output_handler: asyncio.Task | None = None
-        self._sp_state_lock = asyncio.Lock()
+        self._sp_state_lock = asyncio.Condition()
         self._sp_transition_in_progress = False
         self._active_generate_requests = 0
 
@@ -518,6 +518,7 @@ class AsyncOmni(OmniBase):
                         request_id,
                         self._active_generate_requests,
                     )
+                    self._sp_state_lock.notify_all()
 
     async def _process_async_results(
         self,
@@ -934,11 +935,15 @@ class AsyncOmni(OmniBase):
         async with self._sp_state_lock:
             if self._sp_transition_in_progress:
                 raise RuntimeError("Cannot change SP while another SP transition is already running.")
-            if self._active_generate_requests != 0:
-                raise RuntimeError(
-                    f"Cannot change SP while {self._active_generate_requests} request(s) are still in flight."
-                )
             self._sp_transition_in_progress = True
+            logger.info(
+                "[%s] Waiting for %d in-flight request(s) to finish before SP transition %s.",
+                self._name,
+                self._active_generate_requests,
+                worker_method,
+            )
+            await self._sp_state_lock.wait_for(lambda: self._active_generate_requests == 0)
+            logger.info("[%s] In-flight requests drained; starting SP transition %s.", self._name, worker_method)
 
         try:
             stage_results = await self._collect_diffusion_stage_rpc(method=worker_method)

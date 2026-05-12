@@ -341,6 +341,84 @@ async def _run_benchmark_flow(tmp_output_dir: Path) -> None:
         cleanup_dist_env_and_memory()
 
 
+async def _run_transition_wait_flow(tmp_output_dir: Path) -> None:
+    engine = AsyncOmni(
+        model=MODEL_PATH,
+        parallel_config=DiffusionParallelConfig(ulysses_degree=2),
+        master_port=_get_free_port(),
+        shm_threshold_bytes=sys.maxsize,
+    )
+    try:
+        wait_dir = tmp_output_dir / "transition_wait"
+        wait_dir.mkdir(parents=True, exist_ok=True)
+        sp2_path = wait_dir / "sp2_before_shrink.png"
+        sp1_path = wait_dir / "sp1_after_shrink.png"
+        sp2_roundtrip_path = wait_dir / "sp2_after_extend.png"
+
+        print("[SP wait] phase=sp2 begin")
+        gen_task = asyncio.create_task(
+            _run_generate_and_save(
+                engine,
+                prompt=PROMPT,
+                request_id="sp2-wait-request",
+                output_path=sp2_path,
+                label="SP=2-wait",
+                height=1280,
+                width=1280,
+                num_inference_steps=40,
+            )
+        )
+        await asyncio.sleep(0.05)
+
+        print("[SP wait] phase=shrink begin while sp2 request is still running")
+        shrink_task = asyncio.create_task(engine.shrink_sp_one())
+        await asyncio.sleep(0.1)
+        assert not shrink_task.done(), "shrink_sp_one() finished before the in-flight request drained."
+        print("[SP wait] shrink is waiting for the in-flight request to finish")
+
+        sp2_time_s = await gen_task
+        print(f"[SP=2-wait] generate took {sp2_time_s:.3f}s, saved to {sp2_path}")
+
+        await shrink_task
+        print("[SP wait] phase=shrink done")
+
+        print("[SP wait] phase=sp1 begin")
+        sp1_time_s = await _run_generate_and_save(
+            engine,
+            prompt=PROMPT,
+            request_id="sp1-wait-request",
+            output_path=sp1_path,
+            label="SP=1-wait",
+            height=1280,
+            width=1280,
+            num_inference_steps=40,
+        )
+        print(f"[SP=1-wait] generate took {sp1_time_s:.3f}s, saved to {sp1_path}")
+
+        print("[SP wait] phase=extend begin")
+        await engine.extend_sp_two()
+        print("[SP wait] phase=extend done")
+
+        print("[SP wait] phase=sp2_roundtrip begin")
+        sp2_roundtrip_time_s = await _run_generate_and_save(
+            engine,
+            prompt=PROMPT,
+            request_id="sp2-wait-roundtrip-request",
+            output_path=sp2_roundtrip_path,
+            label="SP=2-wait-roundtrip",
+            height=1280,
+            width=1280,
+            num_inference_steps=40,
+        )
+        print(
+            f"[SP=2-wait-roundtrip] generate took {sp2_roundtrip_time_s:.3f}s, "
+            f"saved to {sp2_roundtrip_path}"
+        )
+    finally:
+        engine.shutdown()
+        cleanup_dist_env_and_memory()
+
+
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
@@ -363,3 +441,15 @@ def test_async_omni_sp_switch_benchmark() -> None:
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     asyncio.run(_run_benchmark_flow(OUTPUT_DIR))
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 2, "rocm": 2})
+def test_async_omni_sp_transition_waits_for_inflight_request() -> None:
+    if current_omni_platform.is_npu():
+        pytest.skip("This integration test is currently intended for CUDA/ROCm diffusion workers.")
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    asyncio.run(_run_transition_wait_flow(OUTPUT_DIR))
